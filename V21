@@ -1359,7 +1359,11 @@ do
 			return
 		end
 
-		apply()
+		local now = os.clock()
+		if now >= (state.nextVisualApply or 0) then
+			state.nextVisualApply = now + 0.15
+			apply()
+		end
 
 		if state.restore then
 			state.root.CFrame = state.restore
@@ -1689,6 +1693,13 @@ local function nudgeMouseToward(screenPoint: Vector2, dt: number?): boolean
 end
 
 NPCTargets = NPCTargets or {}
+OS_NPC_REBUILD_CHUNK = 100
+OS_NPC_REBUILD_RUNNING = false
+function OS_npcFeaturesActive(): boolean
+	return PLAYERTOOLS
+		and (PLAYERTOOLS.npcEspEnabled == true or PLAYERTOOLS.npcAimEnabled == true)
+		or false
+end
 local function getNpcCorePart(model: Model)
 	return model:FindFirstChild("HumanoidRootPart")
 		or getCharPart(model, "Head")
@@ -1708,11 +1719,20 @@ local function trackNpcModel(model)
 	end
 end
 local function rebuildNpcTargets()
+	if OS_NPC_REBUILD_RUNNING then
+		return
+	end
+	if not OS_npcFeaturesActive() then
+		table.clear(NPCTargets)
+		return
+	end
+	OS_NPC_REBUILD_RUNNING = true
 	table.clear(NPCTargets)
 	local stack = { Workspace }
 	local processed = 0
 	while #stack > 0 do
 		if not OS_EXEC_IS_CURRENT() then
+			OS_NPC_REBUILD_RUNNING = false
 			return
 		end
 		local current = table.remove(stack)
@@ -1722,18 +1742,28 @@ local function rebuildNpcTargets()
 				trackNpcModel(child.Parent)
 			end
 			table.insert(stack, child)
-			if processed % 250 == 0 then
+			if processed % OS_NPC_REBUILD_CHUNK == 0 then
 				task.wait()
 				if not OS_EXEC_IS_CURRENT() then
+					OS_NPC_REBUILD_RUNNING = false
 					return
 				end
 			end
 		end
 	end
+	OS_NPC_REBUILD_RUNNING = false
+end
+local function requestNpcTargetsRebuild()
+	if OS_NPC_REBUILD_RUNNING or not OS_npcFeaturesActive() then
+		return
+	end
+	task.defer(rebuildNpcTargets)
 end
 table.clear(NPCTargets)
-task.defer(rebuildNpcTargets)
 OS_CONNECT(Workspace.DescendantAdded:Connect(function(desc)
+	if not OS_npcFeaturesActive() then
+		return
+	end
 	if desc:IsA("Humanoid") then
 		task.defer(trackNpcModel, desc.Parent)
 	elseif desc:IsA("Model") then
@@ -1749,6 +1779,9 @@ OS_CONNECT(Workspace.DescendantAdded:Connect(function(desc)
 	end
 end))
 OS_CONNECT(Workspace.DescendantRemoving:Connect(function(desc)
+	if not OS_npcFeaturesActive() and next(NPCTargets) == nil then
+		return
+	end
 	if desc:IsA("Humanoid") then
 		local model = desc.Parent
 		if model then
@@ -1768,7 +1801,7 @@ OS_CONNECT(Workspace.DescendantRemoving:Connect(function(desc)
 end))
 task.spawn(function()
 	while OS_EXEC_IS_CURRENT() do
-		local npcFeaturesActive = (PLAYERTOOLS and (PLAYERTOOLS.npcEspEnabled == true or PLAYERTOOLS.npcAimEnabled == true)) or false
+		local npcFeaturesActive = OS_npcFeaturesActive()
 		if npcFeaturesActive or next(NPCTargets) ~= nil then
 			for model in pairs(NPCTargets) do
 				trackNpcModel(model)
@@ -1824,7 +1857,7 @@ local function findAimClosestPart(partName: string)
 		end
 	end
 
-	if not PLAYERTOOLS or PLAYERTOOLS.npcAimEnabled ~= false then
+	if PLAYERTOOLS and PLAYERTOOLS.npcAimEnabled == true then
 		for model in pairs(NPCTargets) do
 			if alive(model) then
 				considerCandidate(getAimCandidatePart(model, partName))
@@ -2149,7 +2182,7 @@ OS_STRONG_GUI_SURFACES = {}
 OS_GUI_POINTER_BLOCK_ACTION = ("OSGuiPointerBlock_%s_%s"):format(LocalPlayer.UserId, tostring(OS_EXEC_ID))
 
 -- Pointer-area input guard. Keep Roblox GuiButton.Modal off here: Modal can
--- steal camera right-drag globally, while this sink only owns covered pixels.
+-- steal camera drag globally; local hit tests are enough for Fracture controls.
 function OS_registerStrongGuiSurface(obj: Instance?)
 	if obj and obj:IsA("GuiObject") then
 		obj.Active = true
@@ -2244,9 +2277,15 @@ local rainbowFrames = {} :: { Frame }
 OS_RAINBOW_SCROLLBARS = {}
 OS_RAINBOW_GRADIENTS = {}
 OS_RAINBOW_NATIVE_SCROLLBARS = {}
-OS_GUI_TARGET_FPS = 240
+OS_ACTIVE_RAINBOW_GRADIENTS = {}
+OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS = {}
+OS_RAINBOW_TARGETS_DIRTY = true
+OS_RAINBOW_TARGET_SWEEP_INTERVAL = 0.5
+OS_RAINBOW_TARGET_SWEEP_NEXT = 0
+OS_GUI_TARGET_FPS_MAX = 30
+OS_GUI_TARGET_FPS = 30
 OS_GRADIENT_DENSITY_SCALE = 1.45
-OS_RAINBOW_KEYPOINT_STEPS = 14
+OS_RAINBOW_KEYPOINT_STEPS = 8
 OS_SKINNY_GRADIENT_SPAN = 0.16
 OS_SKINNY_GRADIENT_PX = S(10)
 OS_RAINBOW_POINTS = {
@@ -2329,6 +2368,49 @@ function OS_shouldAnimateRainbowTarget(target: Instance?): boolean
 	return true
 end
 
+function OS_markRainbowTargetsDirty()
+	OS_RAINBOW_TARGETS_DIRTY = true
+end
+
+function OS_rebuildActiveRainbowTargets(now: number?)
+	table.clear(OS_ACTIVE_RAINBOW_GRADIENTS)
+	table.clear(OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS)
+
+	for i = #OS_RAINBOW_GRADIENTS, 1, -1 do
+		local gradient = OS_RAINBOW_GRADIENTS[i]
+		if not (gradient and gradient.Parent) then
+			table.remove(OS_RAINBOW_GRADIENTS, i)
+		elseif OS_shouldAnimateRainbowTarget(gradient) then
+			table.insert(OS_ACTIVE_RAINBOW_GRADIENTS, gradient)
+		end
+	end
+
+	for i = #OS_RAINBOW_NATIVE_SCROLLBARS, 1, -1 do
+		local scroller = OS_RAINBOW_NATIVE_SCROLLBARS[i]
+		if not (scroller and scroller.Parent) then
+			table.remove(OS_RAINBOW_NATIVE_SCROLLBARS, i)
+		elseif OS_isGuiObjectVisibleInTree(scroller) then
+			table.insert(OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS, scroller)
+		end
+	end
+
+	for i = #rainbowStrokes, 1, -1 do
+		local stroke = rainbowStrokes[i]
+		if not (stroke and stroke.Parent) then
+			table.remove(rainbowStrokes, i)
+		end
+	end
+	for i = #rainbowFrames, 1, -1 do
+		local frame = rainbowFrames[i]
+		if not (frame and frame.Parent) then
+			table.remove(rainbowFrames, i)
+		end
+	end
+
+	OS_RAINBOW_TARGETS_DIRTY = false
+	OS_RAINBOW_TARGET_SWEEP_NEXT = (now or os.clock()) + OS_RAINBOW_TARGET_SWEEP_INTERVAL
+end
+
 function OS_getGradientGuiSize(target: Instance)
 	local guiObject = OS_getGradientGuiObject(target)
 	if not guiObject then
@@ -2382,6 +2464,7 @@ function OS_registerRainbowGradient(gradient: UIGradient, speed: number?, phase:
 	if not gradient:GetAttribute("RainbowRegistered") then
 		gradient:SetAttribute("RainbowRegistered", true)
 		table.insert(OS_RAINBOW_GRADIENTS, gradient)
+		OS_markRainbowTargetsDirty()
 	end
 	gradient.Color = OS_buildRainbowSequence(
 		gradient:GetAttribute("RainbowSoft") and OS_RAINBOW_SOFT_POINTS or OS_RAINBOW_POINTS,
@@ -2572,6 +2655,7 @@ function OS_registerNativeRainbowScrollbar(scroller: ScrollingFrame)
 	end
 	scroller:SetAttribute("RainbowNativeScrollbarRegistered", true)
 	table.insert(OS_RAINBOW_NATIVE_SCROLLBARS, scroller)
+	OS_markRainbowTargetsDirty()
 end
 
 function OS_setHoverStrokeGradient(stroke: UIStroke?, enabled: boolean, offColor: Color3?, offTransparency: number?, span: number?)
@@ -2620,6 +2704,10 @@ function OS_applyAccentGradients(root: Instance)
 		end
 	end
 	for _, obj in ipairs(root:GetDescendants()) do
+		local guiObject = OS_getGradientGuiObject(obj)
+		if guiObject and not OS_isGuiObjectVisibleInTree(guiObject) then
+			continue
+		end
 		if obj:IsA("UIGradient") and obj.Name ~= "OSRainbowAccent" and OS_colorSequenceWantsRainbow(obj.Color) then
 			obj:SetAttribute("RainbowSoft", OS_colorSequenceShouldUseSoftRainbow(obj.Color))
 			OS_registerRainbowGradient(obj, nil, nil, obj:GetAttribute("RainbowSoft") and 0.46 or 0.72)
@@ -3559,6 +3647,7 @@ OS_CONNECT(panel:GetPropertyChangedSignal("Size"):Connect(OS_syncPanelInputBlock
 OS_CONNECT(panel:GetPropertyChangedSignal("Position"):Connect(OS_syncPanelInputBlocker))
 OS_CONNECT(panel:GetPropertyChangedSignal("Visible"):Connect(OS_syncPanelInputBlocker))
 OS_CONNECT(gui:GetPropertyChangedSignal("Enabled"):Connect(OS_syncPanelInputBlocker))
+OS_CONNECT(gui:GetPropertyChangedSignal("Enabled"):Connect(OS_markRainbowTargetsDirty))
 OS_syncPanelInputBlocker()
 openSize = panel.Size
 openSizeBase = panel.Size
@@ -4415,6 +4504,7 @@ function setActiveTab(key: string)
 	for name, page in pairs(tabPages) do
 		page.Visible = name == key
 	end
+	OS_markRainbowTargetsDirty()
 	for name, tab in pairs(tabButtons) do
 		local active = name == key
 		tab.active = active
@@ -4970,7 +5060,7 @@ function OS_buildIndexPage()
 	add("Overview", "Fracture", "This script builds a local Roblox utility GUI with tabs for main feature gates, server job tools, hitbox selection, player tools, POV/freecam camera tools, active-state monitoring, config save/load/export/import, and this searchable index.")
 	add("Overview", "Armed vs Active", "Armed means a feature is allowed to respond to its keybind. Active means the feature is currently doing work. For example, Walk Speed Armed lets the walk key toggle the speed boost; Walk Speed Active means the boost is currently applied.")
 	add("Overview", "No More Question Marks", "The small hover help buttons were removed so they cannot cover slider arrows, text boxes, tabs, or other controls. This INDEX tab replaces them while keeping the information searchable.")
-	add("Overview", "Smooth GUI", "Manual GUI animation targets 240 updates per second for rainbow accents while Roblox TweenService handles minimize, maximize, hover, tab, and menu motion at the client render rate.")
+	add("Overview", "Smooth GUI", "Manual GUI animation targets lightweight updates for rainbow accents while Roblox TweenService handles minimize, maximize, hover, tab, and menu motion at the client render rate.")
 	add("Overview", "Visible-Only Animation", "Animated accents skip hidden tabs and closed surfaces, remove stale GUI references, and cache repeated color gradients per update so the interface stays smooth without doing invisible work.")
 	add("Main", "Main Tab", "Contains gates for ESP, Aim, Noclip, Fling, Invis, NPC ESP/AIM, movement, brightness, jump, gravity, and keybind controls.")
 	add("Main", "ESP", "Highlights other live player characters when ESP is armed and enabled. NPC ESP separately highlights humanoid NPC models when NPC ESP is on.")
@@ -5021,7 +5111,7 @@ function OS_buildIndexPage()
 	add("Keybinds", "Bind Conflicts", "The script checks bind equality when rebinding. Mouse buttons and keyboard keys are stored differently so they can be restored from config.")
 	add("Runtime", "Execution Guard", "The script uses getgenv()._osInspectorExecGuard to clean up older GUI instances, prevent rapid duplicate execution, and ensure loops only run for the current instance.")
 	add("Runtime", "Cleanup", "Runtime connections are collected through OS_CONNECT. Existing invis states and older GUI instances are cleaned before a new GUI is created.")
-	add("Runtime", "Strong GUI Input", "Registered GUI surfaces are Active and protected by a high-priority ContextActionService sink for primary pointer input only. Right-click stays out of the sink so Roblox camera drag remains native.")
+	add("Runtime", "Strong GUI Input", "Registered GUI surfaces are Active and use local hit tests so Fracture controls do not trigger script features underneath them. The script does not globally sink left click, so games can keep receiving normal click input outside the visible GUI.")
 	add("Runtime", "NPC Detection", "NPC targets are humanoid models in Workspace that are not player characters. The script rebuilds and refreshes NPC targets periodically.")
 	add("Runtime", "Camera Sync", "The script tracks Workspace.CurrentCamera changes so aim, POV, and freecam logic use the current camera.")
 	add("Runtime", "Rainbow Runtime", "Rainbow strokes, frames, text, images, scrollbars, and gradients are registered once, animated only while visible, and compacted when destroyed so re-executing or switching tabs does not leave dead animation work behind.")
@@ -5371,7 +5461,14 @@ npcEspBtn.MouseButton1Click:Connect(function()
 	PLAYERTOOLS.npcEspEnabled = not PLAYERTOOLS.npcEspEnabled
 	npcEspBtn.Text = PLAYERTOOLS.npcEspEnabled and "NPC ESP: ON" or "NPC ESP: OFF"
 	setPillToggleVisual(npcEspBtn, PLAYERTOOLS.npcEspEnabled)
-	if not PLAYERTOOLS.npcEspEnabled then
+	if PLAYERTOOLS.npcEspEnabled then
+		requestNpcTargetsRebuild()
+	elseif not PLAYERTOOLS.npcAimEnabled then
+		for model in pairs(NPCTargets) do
+			removeHighlight(model)
+		end
+		table.clear(NPCTargets)
+	else
 		for model in pairs(NPCTargets) do
 			removeHighlight(model)
 		end
@@ -5408,6 +5505,11 @@ npcAimBtn.MouseButton1Click:Connect(function()
 	PLAYERTOOLS.npcAimEnabled = not PLAYERTOOLS.npcAimEnabled
 	npcAimBtn.Text = PLAYERTOOLS.npcAimEnabled and "NPC AIM: ON" or "NPC AIM: OFF"
 	setPillToggleVisual(npcAimBtn, PLAYERTOOLS.npcAimEnabled)
+	if PLAYERTOOLS.npcAimEnabled then
+		requestNpcTargetsRebuild()
+	elseif not PLAYERTOOLS.npcEspEnabled then
+		table.clear(NPCTargets)
+	end
 	if aimEnabled then
 		aimHoldAcquireConsumed = false
 		clearAimTarget()
@@ -9211,14 +9313,17 @@ function OS_applyUiConfig(uiConfig)
 	end
 	local savedFps = tonumber(uiConfig.guiTargetFps)
 	if savedFps then
-		OS_GUI_TARGET_FPS = math.clamp(math.floor(savedFps + 0.5), 30, 240)
+		OS_GUI_TARGET_FPS = math.clamp(math.floor(savedFps + 0.5), 30, OS_GUI_TARGET_FPS_MAX or 60)
 		if OS_RAINBOW_UPDATE_INTERVAL then
 			OS_RAINBOW_UPDATE_INTERVAL = 1 / OS_GUI_TARGET_FPS
+		end
+		if OS_SCROLLBAR_UPDATE_INTERVAL then
+			OS_SCROLLBAR_UPDATE_INTERVAL = 1 / math.min(OS_GUI_TARGET_FPS, 60)
 		end
 	end
 	local savedKeypoints = tonumber(uiConfig.rainbowKeypointSteps)
 	if savedKeypoints then
-		OS_RAINBOW_KEYPOINT_STEPS = math.clamp(math.floor(savedKeypoints + 0.5), 4, 24)
+		OS_RAINBOW_KEYPOINT_STEPS = math.clamp(math.floor(savedKeypoints + 0.5), 4, 10)
 	end
 	if type(setSavedPos) ~= "function" or type(setMinimized) ~= "function" then
 		OS_PENDING_UI_CONFIG = uiConfig
@@ -9622,6 +9727,14 @@ function OS_applyConfig(config)
 		npcAimBtn.Text = PLAYERTOOLS.npcAimEnabled and "NPC AIM: ON" or "NPC AIM: OFF"
 		setPillToggleVisual(npcAimBtn, PLAYERTOOLS.npcAimEnabled)
 	end
+	if PLAYERTOOLS and (PLAYERTOOLS.npcEspEnabled == true or PLAYERTOOLS.npcAimEnabled == true) then
+		requestNpcTargetsRebuild()
+	else
+		for model in pairs(NPCTargets) do
+			removeHighlight(model)
+		end
+		table.clear(NPCTargets)
+	end
 	if tonumber(aim.targetPlayerUserId) then
 		local savedAimPlayer = OS_findPlayerByUserId(aim.targetPlayerUserId)
 		local savedAimChar = savedAimPlayer and savedAimPlayer.Character
@@ -9978,10 +10091,13 @@ end
 function OS_resetEverything()
 	OS_PENDING_UI_CONFIG = nil
 	OS_PENDING_PLAYERTOOLS_CONFIG = nil
-	OS_GUI_TARGET_FPS = 240
-	OS_RAINBOW_KEYPOINT_STEPS = 14
+	OS_GUI_TARGET_FPS = OS_GUI_TARGET_FPS_MAX or 30
+	OS_RAINBOW_KEYPOINT_STEPS = 8
 	if OS_RAINBOW_UPDATE_INTERVAL then
 		OS_RAINBOW_UPDATE_INTERVAL = 1 / OS_GUI_TARGET_FPS
+	end
+	if OS_SCROLLBAR_UPDATE_INTERVAL then
+		OS_SCROLLBAR_UPDATE_INTERVAL = 1 / math.min(OS_GUI_TARGET_FPS, 60)
 	end
 	resetMainTabState()
 	if FREECAM then
@@ -12607,15 +12723,26 @@ end
 
 initPovMoveCamera()
 
+OS_POV_INVISICAM_CLEAR_INTERVAL = 0.08
+OS_POV_INVISICAM_CLEAR_NEXT = 0
 OS_CONNECT(RunService.RenderStepped:Connect(function()
 	if not OS_EXEC_IS_CURRENT() then return end
 	if OS_POVCAM and OS_POVCAM.transparentWalls then
 		OS_updatePovWallTransparency()
 	else
-		OS_clearPovWallTransparency()
+		if OS_POVCAM_TRANSPARENCY
+			and (OS_POVCAM_TRANSPARENCY.allWallsActive
+				or next(OS_POVCAM_TRANSPARENCY.original) ~= nil
+				or OS_POVCAM_TRANSPARENCY.clearAllActive) then
+			OS_clearPovWallTransparency()
+		end
 	end
 	if OS_POVCAM and OS_POVCAM.enabled and not OS_POVCAM.transparentWalls then
-		OS_clearInvisicamTransparency()
+		local now = os.clock()
+		if now >= OS_POV_INVISICAM_CLEAR_NEXT then
+			OS_POV_INVISICAM_CLEAR_NEXT = now + OS_POV_INVISICAM_CLEAR_INTERVAL
+			OS_clearInvisicamTransparency()
+		end
 	end
 end))
 
@@ -13556,6 +13683,7 @@ MINI_COLLAPSED_SIZE = UDim2.fromOffset(S(108), S(108))
 function setMinimized(on: boolean, instant: boolean?)
 	if MINIMIZED == on then return end
 	MINIMIZED = on
+	OS_markRainbowTargetsDirty()
 	setSavedPos(OS_SAVED_PANEL_POS or panel.Position)
 	local transitionToken = (panel:GetAttribute("MinimizeToken") or 0) + 1
 	panel:SetAttribute("MinimizeToken", transitionToken)
@@ -13813,15 +13941,7 @@ local function OS_guiPointerBlockAction(actionName, inputState, input)
 end
 
 pcall(function()
-	ContextActionService:BindActionAtPriority(
-		OS_GUI_POINTER_BLOCK_ACTION,
-		OS_guiPointerBlockAction,
-		false,
-		10000000,
-		Enum.UserInputType.MouseButton1,
-		Enum.UserInputType.MouseButton3,
-		Enum.UserInputType.Touch
-	)
+	ContextActionService:UnbindAction(OS_GUI_POINTER_BLOCK_ACTION)
 end)
 
 OS_NATIVE_CAMERA_DRAG_RELEASE = OS_NATIVE_CAMERA_DRAG_RELEASE or {
@@ -14030,9 +14150,12 @@ end))
 -- =========================
 -- UPDATE LOOP (rainbow + esp + aim)
 -- =========================
-OS_STATUS_UPDATE_INTERVAL = 0.1
+OS_STATUS_UPDATE_INTERVAL = 0.2
 OS_RAINBOW_UPDATE_INTERVAL = 1 / OS_GUI_TARGET_FPS
-OS_ESP_UPDATE_INTERVAL = 0.05
+OS_SCROLLBAR_UPDATE_INTERVAL = 1 / math.min(OS_GUI_TARGET_FPS, 60)
+OS_SCROLLBAR_NEXT_UPDATE = 0
+OS_SCROLLBAR_ACCUM_DT = 0
+OS_ESP_UPDATE_INTERVAL = 0.1
 OS_RAINBOW_NEXT_UPDATE = 0
 OS_ESP_NEXT_UPDATE = 0
 OS_MAIN_UPDATE_BIND_NAME = ("OSMainUpdate_%s_%s"):format(LocalPlayer.UserId, tostring(OS_EXEC_ID))
@@ -14046,7 +14169,6 @@ function OS_runMainUpdate(dt)
 	local accent = Color3.new(1, 1, 1)
 	local rainbowTick = os.clock()
 	local guiVisible = gui and gui.Enabled
-	local espAccent = OS_sampleRainbow(OS_RAINBOW_POINTS, rainbowTick * 0.18)
 
 	if rainbowTick >= OS_STATUS_NEXT_UPDATE then
 		OS_STATUS_NEXT_UPDATE = rainbowTick + OS_STATUS_UPDATE_INTERVAL
@@ -14057,27 +14179,15 @@ function OS_runMainUpdate(dt)
 
 	if guiVisible and rainbowTick >= OS_RAINBOW_NEXT_UPDATE then
 		OS_RAINBOW_NEXT_UPDATE = rainbowTick + OS_RAINBOW_UPDATE_INTERVAL
+		if OS_RAINBOW_TARGETS_DIRTY or rainbowTick >= (OS_RAINBOW_TARGET_SWEEP_NEXT or 0) then
+			OS_rebuildActiveRainbowTargets(rainbowTick)
+		end
 		local sequenceCache = {}
-		for i = #rainbowStrokes, 1, -1 do
-			local s = rainbowStrokes[i]
-			if not (s and s.Parent) then
-				table.remove(rainbowStrokes, i)
-			elseif OS_shouldAnimateRainbowTarget(s) then
-				s.Color = accent
-			end
-		end
-		for i = #rainbowFrames, 1, -1 do
-			local f = rainbowFrames[i]
-			if not (f and f.Parent) then
-				table.remove(rainbowFrames, i)
-			elseif OS_isGuiObjectVisibleInTree(f) then
-				f.BackgroundColor3 = accent
-			end
-		end
-		for i = #OS_RAINBOW_GRADIENTS, 1, -1 do
-			local gradient = OS_RAINBOW_GRADIENTS[i]
+		for i = #OS_ACTIVE_RAINBOW_GRADIENTS, 1, -1 do
+			local gradient = OS_ACTIVE_RAINBOW_GRADIENTS[i]
 			if not (gradient and gradient.Parent) then
-				table.remove(OS_RAINBOW_GRADIENTS, i)
+				table.remove(OS_ACTIVE_RAINBOW_GRADIENTS, i)
+				OS_RAINBOW_TARGETS_DIRTY = true
 			elseif OS_shouldAnimateRainbowTarget(gradient) then
 				local soft = gradient:GetAttribute("RainbowSoft") == true
 				local span = gradient:GetAttribute("RainbowSpan") or 0.22
@@ -14093,18 +14203,39 @@ function OS_runMainUpdate(dt)
 					sequenceCache[cacheKey] = sequence
 				end
 				gradient.Color = sequence
+			else
+				table.remove(OS_ACTIVE_RAINBOW_GRADIENTS, i)
+				OS_RAINBOW_TARGETS_DIRTY = true
 			end
 		end
-		for i = #OS_RAINBOW_NATIVE_SCROLLBARS, 1, -1 do
-			local scroller = OS_RAINBOW_NATIVE_SCROLLBARS[i]
+		for i = #OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS, 1, -1 do
+			local scroller = OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS[i]
 			if not (scroller and scroller.Parent) then
-				table.remove(OS_RAINBOW_NATIVE_SCROLLBARS, i)
+				table.remove(OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS, i)
+				OS_RAINBOW_TARGETS_DIRTY = true
 			elseif OS_isGuiObjectVisibleInTree(scroller) then
 				scroller.ScrollBarImageColor3 = OS_sampleRainbow(OS_RAINBOW_POINTS, rainbowTick * 0.18)
+			else
+				table.remove(OS_ACTIVE_RAINBOW_NATIVE_SCROLLBARS, i)
+				OS_RAINBOW_TARGETS_DIRTY = true
 			end
 		end
 	end
 	if guiVisible then
+		OS_SCROLLBAR_ACCUM_DT = (OS_SCROLLBAR_ACCUM_DT or 0) + (dt or 0)
+		local scrollbarNeedsUpdate = rainbowTick >= (OS_SCROLLBAR_NEXT_UPDATE or 0)
+		if not scrollbarNeedsUpdate then
+			for _, scrollbar in ipairs(OS_RAINBOW_SCROLLBARS) do
+				if scrollbar and (scrollbar.dragging or scrollbar.hovering) then
+					scrollbarNeedsUpdate = true
+					break
+				end
+			end
+		end
+		if scrollbarNeedsUpdate then
+			local scrollbarDt = math.max(OS_SCROLLBAR_ACCUM_DT or 0, dt or 0)
+			OS_SCROLLBAR_ACCUM_DT = 0
+			OS_SCROLLBAR_NEXT_UPDATE = rainbowTick + (OS_SCROLLBAR_UPDATE_INTERVAL or (1 / 60))
 		for i = #OS_RAINBOW_SCROLLBARS, 1, -1 do
 			local scrollbar = OS_RAINBOW_SCROLLBARS[i]
 			if scrollbar and scrollbar.scroller and scrollbar.track and scrollbar.thumb and scrollbar.track.Parent then
@@ -14131,7 +14262,7 @@ function OS_runMainUpdate(dt)
 					local targetWidth = active and math.max(scrollbar.hoverThickness, scrollbar.idleThickness + S(1)) or math.max(scrollbar.idleThickness, S(4))
 					local targetTrackTransparency = active and 0.38 or 0.58
 					local targetThumbTransparency = active and scrollbar.hoverTransparency or scrollbar.idleTransparency
-					local lerpAlpha = math.min(1, dt * 14)
+					local lerpAlpha = math.min(1, scrollbarDt * 14)
 					scrollbar.currentWidth = scrollbar.currentWidth + ((targetWidth - scrollbar.currentWidth) * lerpAlpha)
 					scrollbar.currentTrackTransparency = scrollbar.currentTrackTransparency + ((targetTrackTransparency - scrollbar.currentTrackTransparency) * lerpAlpha)
 					scrollbar.currentThumbTransparency = scrollbar.currentThumbTransparency + ((targetThumbTransparency - scrollbar.currentThumbTransparency) * lerpAlpha)
@@ -14161,6 +14292,7 @@ function OS_runMainUpdate(dt)
 				table.remove(OS_RAINBOW_SCROLLBARS, i)
 			end
 		end
+		end
 	end
 
 	if walkSpeedEnabled and not (FREECAM and FREECAM.enabled) then
@@ -14173,6 +14305,7 @@ function OS_runMainUpdate(dt)
 
 	if espEnabled and rainbowTick >= OS_ESP_NEXT_UPDATE then
 		OS_ESP_NEXT_UPDATE = rainbowTick + OS_ESP_UPDATE_INTERVAL
+		local espAccent = OS_sampleRainbow(OS_RAINBOW_POINTS, rainbowTick * 0.18)
 		local activePlayerCharacters = {} :: { [Model]: boolean }
 		for _, plr in ipairs(Players:GetPlayers()) do
 			if plr ~= LocalPlayer then
@@ -14191,7 +14324,7 @@ function OS_runMainUpdate(dt)
 			end
 		end
 		OS_sweepTrackedPlayerEspCharacters(activePlayerCharacters)
-		if not PLAYERTOOLS or PLAYERTOOLS.npcEspEnabled ~= false then
+		if PLAYERTOOLS and PLAYERTOOLS.npcEspEnabled == true then
 			for model in pairs(NPCTargets) do
 				if alive(model) then
 					local hl = ensureHighlight(model)
