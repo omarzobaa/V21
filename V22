@@ -31,7 +31,7 @@ pcall(function()
 end)
 
 OS_GUI_NAME = "ESP_AIM_StatusGui"
-OS_EXEC_GUARD = getgenv()._osInspectorExecGuard
+local OS_EXEC_GUARD = getgenv()._osInspectorExecGuard
 if type(OS_EXEC_GUARD) ~= "table" then
 	OS_EXEC_GUARD = {}
 	getgenv()._osInspectorExecGuard = OS_EXEC_GUARD
@@ -46,12 +46,12 @@ OS_EXISTING_GUI = OS_EXEC_GUARD.guiRoot and OS_EXEC_GUARD.guiRoot:FindFirstChild
 if not OS_EXISTING_GUI and LocalPlayer:FindFirstChild("PlayerGui") then
 	OS_EXISTING_GUI = LocalPlayer.PlayerGui:FindFirstChild(OS_GUI_NAME)
 end
+pcall(function()
+	if type(OS_EXEC_GUARD.cleanup) == "function" then
+		OS_EXEC_GUARD.cleanup()
+	end
+end)
 if OS_EXISTING_GUI then
-	pcall(function()
-		if type(OS_EXEC_GUARD.cleanup) == "function" then
-			OS_EXEC_GUARD.cleanup()
-		end
-	end)
 	pcall(function()
 		if OS_EXISTING_GUI and OS_EXISTING_GUI.Parent then
 			OS_EXISTING_GUI:Destroy()
@@ -60,12 +60,13 @@ if OS_EXISTING_GUI then
 	OS_EXISTING_GUI = nil
 end
 OS_EXEC_GUARD.instanceId = (OS_EXEC_GUARD.instanceId or 0) + 1
-OS_EXEC_ID = OS_EXEC_GUARD.instanceId
-function OS_EXEC_IS_CURRENT()
-	return getgenv()._osInspectorExecGuard == OS_EXEC_GUARD and OS_EXEC_GUARD.instanceId == OS_EXEC_ID
+local OS_EXEC_ID = OS_EXEC_GUARD.instanceId
+local OS_RUNTIME_STOPPED = false
+local function OS_EXEC_IS_CURRENT()
+	return not OS_RUNTIME_STOPPED and getgenv()._osInspectorExecGuard == OS_EXEC_GUARD and OS_EXEC_GUARD.instanceId == OS_EXEC_ID
 end
-OS_RUNTIME_CONNECTIONS = {}
-function OS_CONNECT(conn)
+local OS_RUNTIME_CONNECTIONS = {}
+local function OS_CONNECT(conn)
 	if conn then
 		table.insert(OS_RUNTIME_CONNECTIONS, conn)
 	end
@@ -2163,7 +2164,12 @@ if not gui.Parent then
 end
 OS_EXEC_GUARD.lockUntil = 0
 OS_CONNECT(gui.Destroying:Connect(function()
-	if getgenv()._osInspectorExecGuard == OS_EXEC_GUARD and OS_EXEC_GUARD.instanceId == OS_EXEC_ID then
+	if OS_EXEC_IS_CURRENT() then
+		if type(OS_EXEC_GUARD.cleanup) == "function" then
+			OS_EXEC_GUARD.cleanup()
+			return
+		end
+		OS_RUNTIME_STOPPED = true
 		pcall(function()
 			ContextActionService:UnbindAction(OS_GUI_POINTER_BLOCK_ACTION)
 		end)
@@ -5096,7 +5102,7 @@ function OS_buildIndexPage()
 	add("Active", "Active Tab", "The Active tab lists all runtime surfaces: armed gates, active effects, aim mode, hitbox, brightness, gravity, POV/freecam, player tracking, return position, checkpoints, and target filters.")
 	add("Active", "Active Rows", "Rows include ESP, Aim, Noclip, Invis, Walk Speed, Fly, jump, brightness, gravity, prediction, NPC toggles, fling, teleport armed, POV, transparent walls, freecam, track, spectate, follow, return position, checkpoints, aim filters, and ESP filters.")
 	add("Active", "On Count", "The ON counter increments for rows that are currently enabled, armed, saved, or non-default. Informational rows like Aim Mode and Selected Hitbox are shown without inflating the count.")
-	add("Config", "Save File", "Save File writes the current captured config to Fracture/config.json when the executor supports writefile, readfile, and isfile.")
+	add("Config", "Save File", "Settings auto-save every second when changed. Save File also writes immediately to Fracture/config.json when the executor supports writefile, readfile, and isfile.")
 	add("Config", "Load File", "Load File reads Fracture/config.json and applies it immediately. Auto-load also checks that same file on script execution.")
 	add("Config", "Export Code", "Export Code creates a portable one-line FRC2 token from the current config and copies it if setclipboard is available.")
 	add("Config", "Import Code", "Import Code accepts the new FRC2 token and the older raw compact JSON format, then applies the decoded config.")
@@ -9105,6 +9111,12 @@ OS_AUTORUN_FILE = OS_CONFIG_FOLDER .. "/autorun.lua"
 OS_CONFIG_STATUS_LABEL = nil
 OS_CONFIG_CODE_BOX = nil
 OS_TELEPORT_QUEUE_CONN = nil
+-- This run owns restoration and saving; no save may capture startup defaults
+-- or the feature shutdown performed by cleanup.
+local OS_CONFIG_RUNTIME = { ready = false, applying = false, autoSaveBlocked = false, introActive = false }
+local setSavedPos, setMinimized
+local MINIMIZED = true
+local OS_SAVED_PANEL_POS
 
 function OS_configStatus(message: string)
 	if OS_CONFIG_STATUS_LABEL then
@@ -9161,8 +9173,8 @@ function OS_copyFreecamSettings()
 	return copy
 end
 
-OS_PENDING_UI_CONFIG = nil
-OS_PENDING_PLAYERTOOLS_CONFIG = nil
+local OS_PENDING_UI_CONFIG = nil
+local OS_PENDING_PLAYERTOOLS_CONFIG = nil
 
 -- Config serializer helpers keep saves data-only: no Instances, connections,
 -- beams, or temporary drag/input objects should cross this boundary.
@@ -9325,7 +9337,7 @@ function OS_applyUiConfig(uiConfig)
 	if savedKeypoints then
 		OS_RAINBOW_KEYPOINT_STEPS = math.clamp(math.floor(savedKeypoints + 0.5), 4, 10)
 	end
-	if type(setSavedPos) ~= "function" or type(setMinimized) ~= "function" then
+	if not OS_CONFIG_RUNTIME.ready or type(setSavedPos) ~= "function" or type(setMinimized) ~= "function" then
 		OS_PENDING_UI_CONFIG = uiConfig
 		return
 	end
@@ -9339,6 +9351,7 @@ function OS_applyUiConfig(uiConfig)
 	if uiConfig.minimized ~= nil then
 		setMinimized(uiConfig.minimized == true, true)
 	end
+	OS_PENDING_UI_CONFIG = nil
 end
 
 function OS_applyPlayerToolsConfig(playerToolsConfig)
@@ -9657,7 +9670,7 @@ function OS_expandConfig(config)
 	}
 end
 
-function OS_applyConfig(config)
+local function OS_applyConfigValues(config)
 	if type(config) ~= "table" then
 		return false, "Config is not valid"
 	end
@@ -9870,6 +9883,21 @@ function OS_applyConfig(config)
 	return true, "Config loaded"
 end
 
+function OS_applyConfig(config)
+	if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready or OS_CONFIG_RUNTIME.applying then
+		return false, "Config is not ready"
+	end
+	OS_CONFIG_RUNTIME.applying = true
+	local ok, applied, message = pcall(OS_applyConfigValues, config)
+	OS_CONFIG_RUNTIME.applying = false
+	if not ok then
+		OS_CONFIG_RUNTIME.autoSaveBlocked = true
+		return false, "Config could not be applied: " .. tostring(applied)
+	end
+	if applied then OS_CONFIG_RUNTIME.autoSaveBlocked = false end
+	return applied, message
+end
+
 OS_CONFIG_EXPORT_PREFIX = "FRC2:"
 OS_CONFIG_EXPORT_KEY = "FractureConfigV2"
 OS_CONFIG_B64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -9991,27 +10019,44 @@ function OS_decodeConfig(text: string)
 	return nil
 end
 
-function OS_saveConfigToFile()
+function OS_saveConfigToFile(silent: boolean?)
+	if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready or OS_CONFIG_RUNTIME.applying or OS_CONFIG_RUNTIME.saving then
+		return false
+	end
+	if silent and OS_CONFIG_RUNTIME.autoSaveBlocked then return false end
 	if not OS_hasFileApi() then
-		OS_configStatus("File save not supported by this executor")
-		return
+		if not silent then OS_configStatus("File save not supported by this executor") end
+		return false
 	end
-	if not OS_ensureConfigFolder() then
-		OS_configStatus("Could not create " .. OS_CONFIG_FOLDER)
-		return
-	end
+	OS_CONFIG_RUNTIME.saving = true
 	local ok, err = pcall(function()
-		writefile(OS_CONFIG_FILE, OS_encodeConfig(OS_captureConfig()))
+		local encoded = OS_encodeConfig(OS_captureConfig())
+		if silent and encoded == OS_CONFIG_RUNTIME.lastSaved then return end
+		if not OS_ensureConfigFolder() then error("Could not create " .. OS_CONFIG_FOLDER) end
+		writefile(OS_CONFIG_FILE, encoded)
+		OS_CONFIG_RUNTIME.lastSaved = encoded
+		OS_CONFIG_RUNTIME.autoSaveBlocked = false
 	end)
-	OS_configStatus(ok and ("Saved " .. OS_CONFIG_FILE) or ("Save failed: " .. tostring(err)))
+	OS_CONFIG_RUNTIME.saving = false
+	if not ok or not silent then
+		OS_configStatus(ok and ("Saved " .. OS_CONFIG_FILE) or ("Save failed: " .. tostring(err)))
+	end
+	return ok
 end
 
 function OS_loadConfigFromFile(silent: boolean?)
+	if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready or OS_CONFIG_RUNTIME.applying then return false end
 	if not OS_hasFileApi() then
 		if not silent then OS_configStatus("File load not supported by this executor") end
 		return false
 	end
-	if not isfile(OS_CONFIG_FILE) then
+	local checked, exists = pcall(isfile, OS_CONFIG_FILE)
+	if not checked then
+		OS_CONFIG_RUNTIME.autoSaveBlocked = true
+		OS_configStatus("Could not check config; auto-save paused")
+		return false
+	end
+	if not exists then
 		if not silent then OS_configStatus("No saved config yet") end
 		return false
 	end
@@ -10019,15 +10064,40 @@ function OS_loadConfigFromFile(silent: boolean?)
 		return readfile(OS_CONFIG_FILE)
 	end)
 	if not ok then
-		if not silent then OS_configStatus("Could not read config") end
+		OS_CONFIG_RUNTIME.autoSaveBlocked = true
+		OS_configStatus("Could not read config; auto-save paused")
 		return false
 	end
 	local decoded = OS_decodeConfig(text)
-	local applied, message = OS_applyConfig(decoded)
-	if not silent or applied then
-		OS_configStatus(message or "Config load failed")
+	local succeeded, applied, message = pcall(OS_applyConfig, decoded)
+	if not succeeded or not applied then
+		OS_CONFIG_RUNTIME.autoSaveBlocked = true
+		OS_configStatus("Config load failed; auto-save paused: " .. tostring(succeeded and message or applied))
+		return false
 	end
-	return applied
+	OS_CONFIG_RUNTIME.autoSaveBlocked = false
+	OS_CONFIG_RUNTIME.lastSaved = text
+	OS_configStatus(message or "Config loaded")
+	return true
+end
+
+function OS_startConfigAutoSave()
+	if OS_CONFIG_RUNTIME.autoSaveStarted then return end
+	OS_CONFIG_RUNTIME.autoSaveStarted = true
+	-- Poll durable settings, not visual animation properties. This also covers
+	-- keybinds and feature changes that do not go through a GUI callback.
+	task.spawn(function()
+		while OS_EXEC_IS_CURRENT() do
+			task.wait(1)
+			if not OS_EXEC_IS_CURRENT() then break end
+			OS_saveConfigToFile(true)
+		end
+	end)
+	OS_CONNECT(Players.PlayerRemoving:Connect(function(player)
+		if player == LocalPlayer and OS_EXEC_IS_CURRENT() then
+			OS_saveConfigToFile(true)
+		end
+	end))
 end
 
 function OS_resetPlayerToolsState()
@@ -10120,12 +10190,8 @@ function OS_resetEverything()
 	if OS_CONFIG_CODE_BOX then
 		OS_CONFIG_CODE_BOX.Text = ""
 	end
-	if OS_hasFileApi() and OS_ensureConfigFolder() then
-		pcall(function()
-			writefile(OS_CONFIG_FILE, OS_encodeConfig(OS_captureConfig()))
-		end)
-	end
-	OS_configStatus("Everything reset")
+	local saved = OS_saveConfigToFile(false)
+	if saved then OS_configStatus("Everything reset and saved") end
 end
 
 function OS_getTeleportQueueFunction()
@@ -10173,6 +10239,8 @@ end
 end
 
 function OS_queueSelfOnTeleport(silent: boolean?)
+	if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready then return false end
+	if OS_CONFIG_RUNTIME.teleportQueued then return true end
 	local queueFn = OS_getTeleportQueueFunction()
 	if not queueFn then
 		if not silent then OS_configStatus("Teleport queue not supported by this executor") end
@@ -10186,6 +10254,7 @@ function OS_queueSelfOnTeleport(silent: boolean?)
 	local ok, err = pcall(function()
 		queueFn(source)
 	end)
+	if ok then OS_CONFIG_RUNTIME.teleportQueued = true end
 	if not silent then
 		OS_configStatus(ok and "Queued for next teleport" or ("Queue failed: " .. tostring(err)))
 	end
@@ -10198,11 +10267,12 @@ function OS_enableTeleportAutoQueue()
 	end
 	local ok, conn = pcall(function()
 		return LocalPlayer.OnTeleport:Connect(function(state)
+			if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready then return end
 			local stateText = tostring(state)
 			if stateText:find("Failed") then
 				return
 			end
-			OS_saveConfigToFile()
+			OS_saveConfigToFile(true)
 			OS_queueSelfOnTeleport(true)
 		end)
 	end)
@@ -10275,7 +10345,7 @@ function OS_buildConfigPage()
 		Font = Enum.Font.GrenzeGotisch,
 		TextSize = S(20),
 		TextColor3 = THEME_MUTED,
-		Text = "Auto-load checks " .. OS_CONFIG_FILE .. ". Re-execute queues automatically on teleport when supported.",
+		Text = "Settings auto-save every second to " .. OS_CONFIG_FILE .. " and load on execution. Teleport re-execute requires executor support.",
 		ZIndex = 54,
 		Parent = pageConfig,
 	})
@@ -10330,13 +10400,8 @@ function OS_buildConfigPage()
 end
 
 OS_buildConfigPage()
-OS_enableTeleportAutoQueue()
-task.defer(function()
-	OS_queueSelfOnTeleport(true)
-end)
-task.defer(function()
-	OS_loadConfigFromFile(true)
-end)
+-- Restoration starts at the end of OS_initUiRuntimeTail, after every page,
+-- feature helper, and UI state controller for this execution is installed.
 
 function beginRebind(kind, button)
 	waitingFor = kind
@@ -13446,7 +13511,9 @@ function playMiniStartupIntro()
 
 	local introToken = (gui:GetAttribute("IntroToken") or 0) + 1
 	gui:SetAttribute("IntroToken", introToken)
+	OS_CONFIG_RUNTIME.introActive = true
 	MINI_USABLE = false
+	panel.Visible = false
 	gui.Enabled = true
 	INTRO_LAYER.Visible = true
 	INTRO_DARK.BackgroundTransparency = 1
@@ -13478,7 +13545,7 @@ function playMiniStartupIntro()
 	})
 	for i, star in ipairs(introStars) do
 		task.delay(I(0.02 * i), function()
-			if gui:GetAttribute("IntroToken") ~= introToken then return end
+			if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 			tween(star, TweenInfo.new(I(0.3), Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
 				BackgroundTransparency = 0.12 + ((i % 5) * 0.08),
 				Position = UDim2.new(star.Position.X.Scale, ((i % 4) - 2) * S(6), star.Position.Y.Scale, ((i % 3) - 1) * S(10)),
@@ -13486,7 +13553,7 @@ function playMiniStartupIntro()
 		end)
 	end
 	task.delay(I(0.26), function()
-		if gui:GetAttribute("IntroToken") ~= introToken then return end
+		if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 		pcall(function()
 			startupSound.TimePosition = 0
 			startupSound:Play()
@@ -13506,11 +13573,11 @@ function playMiniStartupIntro()
 			Transparency = 0.1,
 		})
 		task.delay(I(0.08), function()
-			if gui:GetAttribute("IntroToken") ~= introToken then return end
+			if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 			OS_playLogoSpin(INTRO_LOGO_IMAGE, I(0.55))
 		end)
 		task.delay(I(0.82), function()
-			if gui:GetAttribute("IntroToken") ~= introToken then return end
+			if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 			tween(INTRO_LOGO_SCALE, TweenInfo.new(I(0.12), Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
 				Scale = 0.98,
 			})
@@ -13521,7 +13588,7 @@ function playMiniStartupIntro()
 				Size = UDim2.fromOffset(S(340), S(340)),
 			})
 			task.delay(I(0.12), function()
-				if gui:GetAttribute("IntroToken") ~= introToken then return end
+				if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 				tween(INTRO_LOGO_SCALE, TweenInfo.new(I(0.12), Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 					Scale = 1.16,
 				})
@@ -13538,7 +13605,7 @@ function playMiniStartupIntro()
 					Size = UDim2.fromOffset(S(500), S(500)),
 				})
 				task.delay(I(0.48), function()
-					if gui:GetAttribute("IntroToken") ~= introToken then return end
+					if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 					tween(introBackWordmark, TweenInfo.new(I(0.08), Enum.EasingStyle.Linear, Enum.EasingDirection.Out), {
 						ImageTransparency = 1,
 					})
@@ -13552,7 +13619,7 @@ function playMiniStartupIntro()
 						Size = UDim2.fromOffset(S(240), S(240)),
 					})
 					task.delay(I(0.12), function()
-						if gui:GetAttribute("IntroToken") ~= introToken then return end
+						if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 						INTRO_BACK_TEXT.Visible = false
 						introBackWordmark.ImageTransparency = 1
 						introLogoBackdrop.Visible = true
@@ -13568,7 +13635,7 @@ function playMiniStartupIntro()
 							Size = UDim2.fromOffset(S(288), S(288)),
 						})
 						task.delay(I(0.16), function()
-							if gui:GetAttribute("IntroToken") ~= introToken then return end
+							if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 							tween(INTRO_DARK, TweenInfo.new(I(0.5), Enum.EasingStyle.Quad, Enum.EasingDirection.Out), {
 								BackgroundTransparency = 1,
 							})
@@ -13602,8 +13669,8 @@ function playMiniStartupIntro()
 								Rotation = 0,
 							})
 							task.delay(I(0.38), function()
-								if gui:GetAttribute("IntroToken") ~= introToken then return end
-								mini.Visible = true
+								if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
+								mini.Visible = MINIMIZED
 								setMiniLogoTransparency(0)
 								miniLogoBackdrop.BackgroundTransparency = 0
 								if mini:FindFirstChild("MiniScale") and mini.MiniScale:IsA("UIScale") then
@@ -13614,12 +13681,14 @@ function playMiniStartupIntro()
 								end
 							end)
 							task.delay(I(0.54), function()
-								if gui:GetAttribute("IntroToken") ~= introToken then return end
+								if not OS_EXEC_IS_CURRENT() or gui:GetAttribute("IntroToken") ~= introToken then return end
 								INTRO_LAYER.Visible = false
 								introLogoBackdropStroke.Transparency = 1
 								introLogoBackdrop.BackgroundTransparency = 1
 								INTRO_AURA.BackgroundTransparency = 1
 								MINI_USABLE = true
+								OS_CONFIG_RUNTIME.introActive = false
+								setMinimized(MINIMIZED, true)
 							end)
 						end)
 					end)
@@ -13673,16 +13742,30 @@ makeDraggable(mini)
 -- =========================
 -- Minimize/Open (no smush)
 -- =========================
-MINIMIZED = false
 MINIMIZE_TWEEN_INFO = TweenInfo.new(0.24, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 MINI_INFO_FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 MINI_INFO_SOFT = TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 MINI_INFO_OPEN = TweenInfo.new(0.22, Enum.EasingStyle.Quart, Enum.EasingDirection.Out)
 MINI_COLLAPSED_SIZE = UDim2.fromOffset(S(108), S(108))
+local minimizeTweens = {}
+
+local function minimizeTween(obj, info, props)
+	local animation = tween(obj, info, props)
+	table.insert(minimizeTweens, animation)
+	return animation
+end
 
 function setMinimized(on: boolean, instant: boolean?)
-	if MINIMIZED == on then return end
+	if not OS_EXEC_IS_CURRENT() then return end
+	if OS_CONFIG_RUNTIME.introActive then
+		-- The intro owns presentation until it finishes; config owns the target.
+		MINIMIZED = on
+		return
+	end
+	if MINIMIZED == on and not instant then return end
 	MINIMIZED = on
+	for _, animation in ipairs(minimizeTweens) do animation:Cancel() end
+	table.clear(minimizeTweens)
 	OS_markRainbowTargetsDirty()
 	setSavedPos(OS_SAVED_PANEL_POS or panel.Position)
 	local transitionToken = (panel:GetAttribute("MinimizeToken") or 0) + 1
@@ -13729,11 +13812,11 @@ function setMinimized(on: boolean, instant: boolean?)
 			end
 			if panelScale and panelScale:IsA("UIScale") then
 				panelScale.Scale = 1
-				tween(panelScale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.965 })
+				minimizeTween(panelScale, TweenInfo.new(0.2, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.965 })
 			end
 			if innerScale and innerScale:IsA("UIScale") then
 				innerScale.Scale = 1
-				tween(innerScale, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.985 })
+				minimizeTween(innerScale, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Scale = 0.985 })
 			end
 			if miniScale and miniScale:IsA("UIScale") then
 				miniScale.Scale = 1
@@ -13741,12 +13824,12 @@ function setMinimized(on: boolean, instant: boolean?)
 			if miniLogoScale and miniLogoScale:IsA("UIScale") then
 				miniLogoScale.Scale = 1
 			end
-			tween(inner, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
+			minimizeTween(inner, TweenInfo.new(0.14, Enum.EasingStyle.Quad, Enum.EasingDirection.In), {
 				Position = UDim2.fromOffset(0, -S(58))
 			})
 			task.delay(0.08, function()
 				if MINIMIZED and panel:GetAttribute("MinimizeToken") == transitionToken then
-					tween(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Size = MINI_COLLAPSED_SIZE })
+					minimizeTween(panel, TweenInfo.new(0.18, Enum.EasingStyle.Quad, Enum.EasingDirection.In), { Size = MINI_COLLAPSED_SIZE })
 				end
 			end)
 			task.delay(0.12, function()
@@ -13771,7 +13854,7 @@ function setMinimized(on: boolean, instant: boolean?)
 					setMiniLogoTransparency(0)
 					if miniLogoScale and miniLogoScale:IsA("UIScale") then
 						miniLogoScale.Scale = 0.84
-						tween(miniLogoScale, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+						minimizeTween(miniLogoScale, TweenInfo.new(0.22, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
 					end
 					if panelScale and panelScale:IsA("UIScale") then
 						panelScale.Scale = 1
@@ -13824,9 +13907,9 @@ function setMinimized(on: boolean, instant: boolean?)
 			if innerStroke then
 				innerStroke.Transparency = 1
 			end
-			tween(panel, MINIMIZE_TWEEN_INFO, { Size = openSize })
+			minimizeTween(panel, MINIMIZE_TWEEN_INFO, { Size = openSize })
 			if panelScale and panelScale:IsA("UIScale") then
-				tween(panelScale, TweenInfo.new(0.26, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+				minimizeTween(panelScale, TweenInfo.new(0.26, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
 			end
 			if miniScale and miniScale:IsA("UIScale") then
 				miniScale.Scale = 1
@@ -13842,11 +13925,11 @@ function setMinimized(on: boolean, instant: boolean?)
 			task.delay(0.08, function()
 				if not MINIMIZED and panel.Visible and panel:GetAttribute("MinimizeToken") == transitionToken then
 					inner.Visible = true
-					tween(inner, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
+					minimizeTween(inner, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), {
 						Position = UDim2.fromOffset(0, 0)
 					})
 					if innerScale and innerScale:IsA("UIScale") then
-						tween(innerScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
+						minimizeTween(innerScale, TweenInfo.new(0.3, Enum.EasingStyle.Back, Enum.EasingDirection.Out), { Scale = 1 })
 					end
 				end
 			end)
@@ -13854,7 +13937,7 @@ function setMinimized(on: boolean, instant: boolean?)
 				if not MINIMIZED and panel.Visible and panel:GetAttribute("MinimizeToken") == transitionToken then
 					top.Visible = true
 					if innerStroke then
-						tween(innerStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Transparency = 0.25 })
+						minimizeTween(innerStroke, TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out), { Transparency = 0.25 })
 					end
 				end
 			end)
@@ -13883,17 +13966,6 @@ function setMinimized(on: boolean, instant: boolean?)
 			end
 		end)
 	end
-end
-
-setMinimized(true, true)
-playMiniStartupIntro()
-if OS_PENDING_UI_CONFIG then
-	task.defer(function()
-		if OS_PENDING_UI_CONFIG then
-			OS_applyUiConfig(OS_PENDING_UI_CONFIG)
-			OS_PENDING_UI_CONFIG = nil
-		end
-	end)
 end
 
 minimizeBtn.MouseButton1Click:Connect(function()
@@ -14516,6 +14588,15 @@ OS_CONNECT(LocalPlayer.CharacterAdded:Connect(function(character)
 end))
 
 OS_EXEC_GUARD.cleanup = function()
+	if not OS_EXEC_IS_CURRENT() then return end
+	-- Capture enabled features before teardown turns them off.
+	OS_saveConfigToFile(true)
+	OS_CONFIG_RUNTIME.ready = false
+	OS_RUNTIME_STOPPED = true
+	gui:SetAttribute("IntroToken", (gui:GetAttribute("IntroToken") or 0) + 1)
+	panel:SetAttribute("MinimizeToken", (panel:GetAttribute("MinimizeToken") or 0) + 1)
+	for _, animation in ipairs(minimizeTweens) do animation:Cancel() end
+	table.clear(minimizeTweens)
 	pcall(function()
 		ContextActionService:UnbindAction(OS_GUI_POINTER_BLOCK_ACTION)
 	end)
@@ -14599,7 +14680,18 @@ OS_EXEC_GUARD.cleanup = function()
 		end
 	end)
 	OS_EXEC_GUARD.lockUntil = 0
+	OS_EXEC_GUARD.cleanup = nil
 end
+
+-- One startup owner: build everything, restore durable state, then present it.
+OS_CONFIG_RUNTIME.ready = true
+setMinimized(MINIMIZED, true)
+OS_loadConfigFromFile(true)
+if OS_PENDING_UI_CONFIG then OS_applyUiConfig(OS_PENDING_UI_CONFIG) end
+playMiniStartupIntro()
+OS_enableTeleportAutoQueue()
+OS_queueSelfOnTeleport(true)
+OS_startConfigAutoSave()
 
 end
 
