@@ -359,9 +359,25 @@ for k, v in pairs(FREECAM_DEFAULTS) do
 		FREECAM.settings[k] = v
 	end
 end
-for _, key in ipairs(FREECAM_VISUAL_DEFAULT_KEYS) do
-	FREECAM.settings[key] = FREECAM_DEFAULTS[key]
+function OS_normalizeFreecamSettings(settings)
+	settings = type(settings) == "table" and settings or {}
+	local limits = {
+		speed = { 0, math.max(WALK_SPEED_INPUT_MAX, FLY_SPEED_INPUT_MAX) }, lookSensitivity = { 1, 200 },
+		fieldOfView = { 1, 120 }, focusDistance = { 0, 500 }, focusRadius = { 0, 100 },
+		blurNear = { 0, 100 }, blurFar = { 0, 100 }, saturation = { 0, 100 },
+		contrast = { 0, 100 }, timeOfDay = { 0, 24 }, bloom = { 0, 100 },
+		sunRays = { 0, 100 }, vignette = { 0, 100 },
+	}
+	local normalized = {}
+	for key, range in pairs(limits) do
+		local value = tonumber(settings[key])
+		if not value or value ~= value or math.abs(value) == math.huge then value = FREECAM_DEFAULTS[key] end
+		normalized[key] = math.clamp(value, range[1], range[2])
+	end
+	normalized.hideChat = settings.hideChat == true
+	return normalized
 end
+FREECAM.settings = OS_normalizeFreecamSettings(FREECAM.settings)
 
 function OS_getFreecamSpeedValue()
 	local base = (FREECAM and FREECAM.settings and FREECAM.settings.speed) or math.max(walkSpeedValue, flySpeedValue)
@@ -1186,6 +1202,20 @@ do
 		return state.character and state.root and state.character.Parent and state.root.Parent
 	end
 
+	local function wakeRootForReplication()
+		if not live() or state.root.Anchored then return end
+		local root = state.root
+		local mass = root.AssemblyMass
+		if mass <= 0 or mass == math.huge then return end
+		local velocity = root.AssemblyLinearVelocity
+		-- Stationary assemblies can sleep, so the CFrame swap alone may never
+		-- reach other clients. A nonzero impulse explicitly wakes the assembly.
+		-- Restore velocity immediately, before simulation, so no step or drift
+		-- is introduced. See Roblox's physics/sleep-system documentation.
+		root:ApplyImpulse(Vector3.new(0, mass * 0.01, 0))
+		root.AssemblyLinearVelocity = velocity
+	end
+
 	local function getVisualModifier(baseTransparency)
 		if baseTransparency >= VISUAL_ALPHA then
 			return 0
@@ -1273,6 +1303,7 @@ do
 		end
 		state.descendantConn = character.DescendantAdded:Connect(registerVisual)
 
+		if state.on then wakeRootForReplication() end
 		apply()
 		syncUi()
 	end
@@ -1289,6 +1320,8 @@ do
 			state.restore = nil
 		end
 
+		-- Wake on both transitions so stationary enable and disable replicate.
+		wakeRootForReplication()
 		apply()
 		syncUi()
 	end
@@ -1349,6 +1382,7 @@ do
 	end))
 
 	RunService:BindToRenderStep(BIND_NAME, Enum.RenderPriority.Camera.Value - 1, function()
+		if getgenv()[KEY] ~= state then return end
 		if state.restore and live() then
 			state.root.CFrame = state.restore
 		end
@@ -1356,7 +1390,7 @@ do
 	end)
 
 	table.insert(state.connections, RunService.Heartbeat:Connect(function()
-		if not state.on or not live() then
+		if getgenv()[KEY] ~= state or not state.on or not live() then
 			return
 		end
 
@@ -1371,6 +1405,11 @@ do
 			state.restore = nil
 		end
 
+		-- Keep idle characters awake for each outgoing hidden-pose update;
+		-- a one-time wake would stop working when physics sleeps again.
+		if state.root.AssemblyLinearVelocity.Magnitude < 0.5 then
+			wakeRootForReplication()
+		end
 		local current = state.root.CFrame
 		state.restore = current
 		state.root.CFrame = current * SHIFT
@@ -1415,13 +1454,15 @@ if LocalPlayer.Character then
 end
 OS_CONNECT(LocalPlayer.CharacterAdded:Connect(function(character)
 	if not OS_EXEC_IS_CURRENT() then return end
-	local restoreFly = flyEnabled
+	local restoreFly = flyEnabled or (FREECAM and FREECAM.enabled and FREECAM.previousFlyEnabled == true)
+	local restoreWalk = FREECAM and FREECAM.enabled and FREECAM.previousWalkEnabled == true
 	INFINITE_JUMP_ARMED = true
 	LAST_INFINITE_JUMP_AT = 0
 	onNoclipCharacterAdded(character)
 	if FREECAM and FREECAM.enabled and FREECAM.stop then
-		FREECAM.stop()
+		FREECAM.stop(false)
 	end
+	if restoreWalk then setWalkSpeedEnabledState(true, true) end
 	cleanupFly()
 	if restoreFly then
 		task.defer(function()
@@ -1429,6 +1470,7 @@ OS_CONNECT(LocalPlayer.CharacterAdded:Connect(function(character)
 			if not hum then return end
 			local root = character:FindFirstChild("HumanoidRootPart") or character:WaitForChild("HumanoidRootPart", 5)
 			if not root then return end
+			if not OS_EXEC_IS_CURRENT() or LocalPlayer.Character ~= character or (FREECAM and FREECAM.enabled) then return end
 			flyEnabled = true
 			if flyEnabledCtl then
 				flyEnabledCtl.setOn(true)
@@ -5096,7 +5138,7 @@ function OS_buildIndexPage()
 	add("Teleport", "Click Teleport", "Teleport Armed uses the teleport bind, Left Click by default, to move your character directly to the mouse hit point without extra wall or floor offset.")
 	add("POV", "POV Tab", "POV controls camera zoom, transparent walls, and free camera controls. POV can force Classic camera and high max zoom.")
 	add("POV", "Transparent Walls", "When enabled, world BaseParts outside your character get LocalTransparencyModifier applied so walls become see-through locally.")
-	add("Freecam", "Free Cam", "Freecam opens a separate camera view with move speed, look sensitivity, field of view, depth of field, saturation, contrast, time of day, bloom, sun rays, vignette, and hide chat controls. Press Shift to toggle mouse unlock while Freecam is active, then click-drag outside the menu to look around.")
+	add("Freecam", "Free Cam", "Freecam opens a separate camera view with move speed, look sensitivity, field of view, depth of field, saturation, contrast, time of day, bloom, sun rays, vignette, and hide chat controls. Press Shift to toggle mouse unlock while Freecam is active. Hold right click outside the menu to look around with the cursor locked in place; release it to free the cursor.")
 	add("Freecam", "Freecam Reset", "Reset Free Cam Settings restores freecam movement and visual settings to defaults captured in FREECAM_DEFAULTS.")
 	add("Job", "Job Tab", "Job tools copy the current server JobId, autofill it into the join box, join a pasted JobId, or rejoin the current server.")
 	add("Active", "Active Tab", "The Active tab lists all runtime surfaces: armed gates, active effects, aim mode, hitbox, brightness, gravity, POV/freecam, player tracking, return position, checkpoints, and target filters.")
@@ -7091,7 +7133,7 @@ function OS_freecamSwitchRow(labelText: string, getter, setter)
 		local value = not getter()
 		setter(value)
 		setOn(value)
-		if FREECAM.enabled and FREECAM.applyVisuals then
+		if FREECAM.enabled and not FREECAM.refreshingSettings and FREECAM.applyVisuals then
 			FREECAM.applyVisuals()
 		end
 	end
@@ -7250,6 +7292,11 @@ function OS_freecamSlider(titleText: string, minValue: number, maxValue: number,
 	end
 
 	setValue = function(value: number, showLimitError: boolean?)
+		if type(value) ~= "number" or value ~= value or math.abs(value) == math.huge then
+			showError("Enter a finite number")
+			valueBox.Text = string.format("%." .. decimals .. "f", FREECAM.settings[key])
+			return
+		end
 		local clamped = value
 		if clamped < minValue then clamped = minValue end
 		if clamped > actualMax then
@@ -7269,7 +7316,7 @@ function OS_freecamSlider(titleText: string, minValue: number, maxValue: number,
 		if callback then
 			callback(clamped)
 		end
-		if FREECAM.enabled and FREECAM.applyVisuals then
+		if FREECAM.enabled and not FREECAM.refreshingSettings and FREECAM.applyVisuals then
 			FREECAM.applyVisuals()
 		end
 	end
@@ -7327,18 +7374,20 @@ function OS_freecamSlider(titleText: string, minValue: number, maxValue: number,
 	end)
 end
 
-function OS_resetFreecamSettings()
-	for k, v in pairs(FREECAM.defaults or FREECAM_DEFAULTS) do
-		FREECAM.settings[k] = v
-	end
+function OS_applyFreecamSettings(settings)
+	FREECAM.settings = OS_normalizeFreecamSettings(settings)
+	FREECAM.refreshingSettings = true
 	for _, refresh in ipairs(FREECAM.refreshUi or {}) do
-		refresh()
+		pcall(refresh)
 	end
+	FREECAM.refreshingSettings = false
 	if FREECAM.enabled and FREECAM.applyVisuals then
 		FREECAM.applyVisuals()
-	elseif FREECAM.restoreVisuals then
-		FREECAM.restoreVisuals()
 	end
+end
+
+function OS_resetFreecamSettings()
+	OS_applyFreecamSettings(FREECAM.defaults or FREECAM_DEFAULTS)
 end
 
 function OS_getFreecamSpeed()
@@ -7378,14 +7427,40 @@ function OS_isFreecamLookDragButton(input: InputObject?): boolean
 	if not input then
 		return false
 	end
-	return input.UserInputType == Enum.UserInputType.MouseButton1
-		or input.UserInputType == Enum.UserInputType.MouseButton2
+	return input.UserInputType == Enum.UserInputType.MouseButton2
 end
 
 function OS_resetFreecamLookDrag()
 	FREECAM.lookDragActive = false
 	FREECAM.lookDragButton = nil
-	FREECAM.lookDragLastPosition = nil
+end
+
+function OS_isFreecamInputSuspended(): boolean
+	-- dragLock is shared with other tabs and can outlive a focus/release event.
+	-- Only an actual held GUI drag may block navigation; an idle flag may not.
+	local pointerHeld = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+	if FREECAM.isMobile then pointerHeld = #UserInputService:GetTouches() > 0 end
+	return FREECAM.windowFocused == false or FREECAM.menuOpen == true
+		or (dragLock and pointerHeld) or UserInputService:GetFocusedTextBox() ~= nil
+end
+
+function OS_applyFreecamMouseState(): boolean
+	if not FREECAM.enabled or FREECAM.isMobile or OS_isFreecamInputSuspended() then
+		OS_resetFreecamLookDrag()
+		OS_releaseFreecamMouse()
+		return false
+	end
+	if FREECAM.lookDragActive and not UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton2) then
+		OS_resetFreecamLookDrag()
+	end
+	local behavior = Enum.MouseBehavior.LockCenter
+	if FREECAM.mouseUnlocked then
+		behavior = FREECAM.lookDragActive and Enum.MouseBehavior.LockCurrentPosition or Enum.MouseBehavior.Default
+	end
+	UserInputService.MouseBehavior = behavior
+	UserInputService.MouseIconEnabled = true
+	UserInputService.OverrideMouseIconBehavior = Enum.OverrideMouseIconBehavior.None
+	return behavior ~= Enum.MouseBehavior.Default
 end
 
 function OS_applyFreecamLookDelta(delta)
@@ -7405,7 +7480,7 @@ function OS_beginFreecamLookDrag(input: InputObject?): boolean
 	if not (FREECAM and FREECAM.enabled and FREECAM.mouseUnlocked == true) then
 		return false
 	end
-	if FREECAM.isMobile or UserInputService:GetFocusedTextBox() then
+	if FREECAM.isMobile or OS_isFreecamInputSuspended() then
 		return false
 	end
 	if not OS_isFreecamLookDragButton(input) then
@@ -7416,29 +7491,8 @@ function OS_beginFreecamLookDrag(input: InputObject?): boolean
 	end
 	FREECAM.lookDragActive = true
 	FREECAM.lookDragButton = input.UserInputType
-	FREECAM.lookDragLastPosition = input.Position
-	OS_releaseFreecamMouse()
+	OS_applyFreecamMouseState()
 	return true
-end
-
-function OS_updateFreecamLookDrag(input: InputObject?)
-	if not (FREECAM and FREECAM.enabled and FREECAM.mouseUnlocked == true and FREECAM.lookDragActive) then
-		return
-	end
-	if not input or input.UserInputType ~= Enum.UserInputType.MouseMovement then
-		return
-	end
-
-	local delta = input.Delta
-	if FREECAM.lookDragLastPosition and input.Position then
-		local fallbackDelta = input.Position - FREECAM.lookDragLastPosition
-		if not delta or math.abs(delta.X) + math.abs(delta.Y) <= 0.001 then
-			delta = fallbackDelta
-		end
-	end
-	FREECAM.lookDragLastPosition = input.Position
-	OS_applyFreecamLookDelta(delta)
-	OS_releaseFreecamMouse()
 end
 
 function OS_endFreecamLookDrag(input: InputObject?)
@@ -7449,11 +7503,11 @@ function OS_endFreecamLookDrag(input: InputObject?)
 		return
 	end
 	OS_resetFreecamLookDrag()
-	OS_releaseFreecamMouse()
+	OS_applyFreecamMouseState()
 end
 
 function OS_ensureFreecamControls()
-	if FREECAM.controls ~= nil then return FREECAM.controls end
+	if FREECAM.controls then return FREECAM.controls end
 	local ok, controls = pcall(function()
 		local playerScripts = LocalPlayer:FindFirstChild("PlayerScripts")
 		if not playerScripts then return nil end
@@ -7461,8 +7515,9 @@ function OS_ensureFreecamControls()
 		if not module then return nil end
 		return require(module):GetControls()
 	end)
-	FREECAM.controls = ok and controls or false
-	return ok and controls or nil
+	-- PlayerModule may not exist yet during startup or respawn. Retry later.
+	FREECAM.controls = ok and controls or nil
+	return FREECAM.controls
 end
 
 function OS_ensureFreecamEffect(className: string, name: string)
@@ -7497,10 +7552,8 @@ function OS_destroyFreecamEffects()
 end
 
 function OS_hideFreecamUi()
-	if FREECAM.isMobile and type(FREECAM.mobileHideUi) == "function" and FREECAM.mobileHideUi ~= OS_hideFreecamUi then
-		FREECAM.mobileHideUi()
-		return
-	end
+	if FREECAM.mobileUpBtn then FREECAM.mobileUpBtn.Visible = false end
+	if FREECAM.mobileDownBtn then FREECAM.mobileDownBtn.Visible = false end
 	if not FREECAM.uiDefaults then
 		return
 	end
@@ -7516,11 +7569,11 @@ function OS_hideFreecamUi()
 end
 
 function OS_showFreecamUi()
-	if FREECAM.isMobile and type(FREECAM.mobileShowUi) == "function" and FREECAM.mobileShowUi ~= OS_showFreecamUi then
-		FREECAM.mobileShowUi()
-		return
+	if FREECAM.mobileUpBtn then FREECAM.mobileUpBtn.Visible = FREECAM.isMobile == true end
+	if FREECAM.mobileDownBtn then FREECAM.mobileDownBtn.Visible = FREECAM.isMobile == true end
+	if ACTIVE_TAB_KEY ~= "FREECAM" then
+		FREECAM.previousTab = ACTIVE_TAB_KEY or "MAIN"
 	end
-	FREECAM.previousTab = ACTIVE_TAB_KEY and ACTIVE_TAB_KEY ~= "FREECAM" and ACTIVE_TAB_KEY or "MAIN"
 	tabBar.Visible = false
 	TAB_ACTIVE_LAYER.Visible = false
 	pages.Position = UDim2.new(0, 0, 0, 0)
@@ -7534,6 +7587,7 @@ end
 
 function OS_resetFreecamRuntimeState()
 	FREECAM.enabled = false
+	if FREECAM.renderBindName then RunService:UnbindFromRenderStep(FREECAM.renderBindName) end
 	if FREECAM.connection then
 		FREECAM.connection:Disconnect()
 		FREECAM.connection = nil
@@ -7653,9 +7707,11 @@ function OS_restoreFreecamCharacterState()
 		FREECAM.rootPart.AssemblyLinearVelocity = Vector3.zero
 		FREECAM.rootPart.AssemblyAngularVelocity = Vector3.zero
 	end
-	if FREECAM.controls and FREECAM.controls.Enable and not FREECAM.isMobile then
+	local disabledControls = FREECAM.disabledControls
+	FREECAM.disabledControls = nil
+	if disabledControls and disabledControls.Enable then
 		pcall(function()
-			FREECAM.controls:Enable()
+			disabledControls:Enable()
 		end)
 	end
 end
@@ -7682,13 +7738,38 @@ function OS_restoreFreecamFeatureState()
 	end
 end
 
+function OS_syncFreecamCamera()
+	OS_syncCurrentCamera()
+	if not Workspace.CurrentCamera then return nil end
+	FREECAM.cameraBackups = FREECAM.cameraBackups or {}
+	if not FREECAM.cameraBackups[Camera] then
+		FREECAM.cameraBackups[Camera] = {
+			fieldOfView = Camera.FieldOfView,
+			focus = Camera.Focus,
+			cameraType = Camera.CameraType,
+		}
+	end
+	Camera.CameraType = Enum.CameraType.Scriptable
+	Camera.FieldOfView = FREECAM.settings.fieldOfView
+	return Camera
+end
+
 function OS_freecamRestoreVisuals()
 	local lighting = FREECAM.lighting
 	local vignette = FREECAM.vignette
 	local destroyEffects = FREECAM.destroyEffects
 	local backup = FREECAM.backup
+	if FREECAM.cameraBackups then
+		for camera, properties in pairs(FREECAM.cameraBackups) do
+			pcall(function()
+				camera.FieldOfView = properties.fieldOfView
+				camera.Focus = properties.focus
+				camera.CameraType = properties.cameraType
+			end)
+		end
+	end
 	if backup then
-		Camera.FieldOfView = backup.fieldOfView or Camera.FieldOfView
+		if not FREECAM.cameraBackups then Camera.FieldOfView = backup.fieldOfView or Camera.FieldOfView end
 		if lighting then
 			lighting.ClockTime = backup.clockTime or lighting.ClockTime
 		end
@@ -7700,16 +7781,16 @@ function OS_freecamRestoreVisuals()
 		vignette.Visible = false
 		vignette.ImageTransparency = 1
 	end
-	local chatEnabled = true
-	if backup then
-		chatEnabled = backup.chatEnabled ~= false
+	if backup and backup.chatEnabled ~= nil then
+		pcall(function()
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, backup.chatEnabled)
+		end)
 	end
-	pcall(function()
-		StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, chatEnabled)
-	end)
+	FREECAM.cameraBackups = nil
 end
 
 function OS_freecamApplyVisuals()
+	if not FREECAM.enabled then return end
 	local settings = FREECAM.settings
 	local lighting = FREECAM.lighting
 	local vignette = FREECAM.vignette
@@ -7718,7 +7799,7 @@ function OS_freecamApplyVisuals()
 		return
 	end
 
-	Camera.FieldOfView = settings.fieldOfView
+	OS_syncFreecamCamera()
 	lighting.ClockTime = settings.timeOfDay
 
 	local bloom = ensureEffect("BloomEffect", "OSFreecamBloom")
@@ -7771,45 +7852,28 @@ end
 
 function OS_freecamUpdate(dt: number)
 	if not FREECAM.enabled then return end
+	-- Do not turn a stalled/background frame into a large camera jump.
+	dt = math.clamp(dt, 0, 1 / 15)
 
-	OS_syncCurrentCamera()
-	if Camera.CameraType ~= Enum.CameraType.Scriptable then
-		Camera.CameraType = Enum.CameraType.Scriptable
-	end
+	if not OS_syncFreecamCamera() then return end
 
 	local isMobile = FREECAM.isMobile == true
-	local mouseUnlocked = (not isMobile) and FREECAM.mouseUnlocked == true
-	local interacting = dragLock or UserInputService:GetFocusedTextBox() ~= nil or mouseUnlocked
-	if isMobile then
-		FREECAM.mouseUnlocked = false
-		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-	else
-		local lookDelta = Vector2.zero
-		if interacting then
-			OS_releaseFreecamMouse()
-		else
-			pcall(function()
-				UserInputService.MouseIconEnabled = true
-				UserInputService.OverrideMouseIconBehavior = Enum.OverrideMouseIconBehavior.None
-			end)
-			UserInputService.MouseBehavior = Enum.MouseBehavior.LockCenter
-			lookDelta = UserInputService:GetMouseDelta()
-		end
-		if lookDelta.Magnitude > 0 then
-			OS_applyFreecamLookDelta(lookDelta)
-		end
+	local suspended = OS_isFreecamInputSuspended()
+	-- Both look modes use one owner and one delta sample per rendered frame.
+	if OS_applyFreecamMouseState() then
+		OS_applyFreecamLookDelta(UserInputService:GetMouseDelta())
 	end
 
 	FREECAM.rotation = Vector2.new(math.clamp(FREECAM.rotation.X, -math.pi / 2, math.pi / 2), FREECAM.rotation.Y)
 
 	local moveVector = Vector3.zero
-	if isMobile then
+	if not suspended and isMobile then
 		local ensureControls = FREECAM.ensureControls
 		local controls = type(ensureControls) == "function" and ensureControls() or nil
 		if controls then
 			moveVector = controls:GetMoveVector()
 		end
-	else
+	elseif not suspended then
 		if UserInputService:IsKeyDown(Enum.KeyCode.W) or UserInputService:IsKeyDown(Enum.KeyCode.Up) then
 			moveVector += Vector3.new(0, 0, -1)
 		end
@@ -7824,10 +7888,10 @@ function OS_freecamUpdate(dt: number)
 		end
 	end
 
-	if isMobile then
+	if not suspended and isMobile then
 		if FREECAM.moveUp then moveVector += Vector3.new(0, 1, 0) end
 		if FREECAM.moveDown then moveVector += Vector3.new(0, -1, 0) end
-	else
+	elseif not suspended then
 		if UserInputService:IsKeyDown(Enum.KeyCode.Space) or UserInputService:IsKeyDown(Enum.KeyCode.E) then
 			moveVector += Vector3.new(0, 1, 0)
 		end
@@ -7853,17 +7917,21 @@ function OS_freecamUpdate(dt: number)
 	end
 	FREECAM.position = position
 	Camera.CFrame = CFrame.new(position) * rotation
+	Camera.Focus = Camera.CFrame * CFrame.new(0, 0, -math.max(1, FREECAM.settings.focusDistance))
 end
 
 function OS_freecamStop(restoreFeatures: boolean?)
 	local wasEnabled = FREECAM.enabled == true
+	if not wasEnabled and not FREECAM.backup and not FREECAM.humanoidBackup and not FREECAM.disabledControls then
+		return
+	end
 	OS_resetFreecamRuntimeState()
 	OS_syncCurrentCamera()
 	if type(FREECAM.restoreVisuals) == "function" then
 		FREECAM.restoreVisuals()
 	end
 	OS_restoreFreecamCharacterState()
-	OS_restorePlayerCamera(FREECAM.humanoid)
+	OS_restorePlayerCamera(getHumanoid())
 	if OS_POVCAM then
 		OS_applyPovCameraState(not OS_POVCAM.enabled)
 	end
@@ -7889,6 +7957,10 @@ function OS_freecamStart()
 		OS_showFreecamUi()
 		return
 	end
+	OS_syncCurrentCamera()
+	if not Workspace.CurrentCamera then return end
+	FREECAM.settings = OS_normalizeFreecamSettings(FREECAM.settings)
+	FREECAM.cameraBackups = nil
 	OS_cancelFreecamExitMouseReset()
 
 	if PLAYERTOOLS and PLAYERTOOLS.stopAll then
@@ -7912,14 +7984,13 @@ function OS_freecamStart()
 	FREECAM.backup = {
 		fieldOfView = Camera.FieldOfView,
 		clockTime = lighting and lighting.ClockTime or 0,
-		chatEnabled = chatEnabledOk and chatEnabledValue or true,
 	}
+	if chatEnabledOk then
+		FREECAM.backup.chatEnabled = chatEnabledValue
+	end
 
 	local humanoid = getHumanoid()
 	FREECAM.humanoid = humanoid
-	if FREECAM.settings.speed == nil or FREECAM.settings.speed < 1 then
-		FREECAM.settings.speed = math.max(25, walkSpeedValue, flySpeedValue)
-	end
 	if humanoid then
 		FREECAM.humanoidBackup = {
 			walkSpeed = humanoid.WalkSpeed,
@@ -7942,13 +8013,20 @@ function OS_freecamStart()
 
 	local ensureControls = FREECAM.ensureControls
 	local controls = type(ensureControls) == "function" and ensureControls() or nil
+	FREECAM.disabledControls = nil
 	if controls and controls.Disable and not FREECAM.isMobile then
-		pcall(function()
-			controls:Disable()
+		local stateOk, controlsEnabled = pcall(function()
+			return controls.controlsEnabled
 		end)
+		if not stateOk or controlsEnabled ~= false then
+			local disabled = pcall(function()
+				controls:Disable()
+			end)
+			if disabled then FREECAM.disabledControls = controls end
+		end
 	end
 
-	OS_syncCurrentCamera()
+	OS_syncFreecamCamera()
 	local lookVector = Camera.CFrame.LookVector
 	FREECAM.rotation = Vector2.new(
 		math.asin(math.clamp(lookVector.Y, -1, 1)),
@@ -7982,13 +8060,15 @@ function OS_freecamStart()
 		FREECAM.connection:Disconnect()
 		FREECAM.connection = nil
 	end
-	FREECAM.connection = RunService.RenderStepped:Connect(function(dt)
+	RunService:BindToRenderStep(FREECAM.renderBindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
 		if not OS_EXEC_IS_CURRENT() or not FREECAM.enabled then
 			return
 		end
 		local ok, err = pcall(FREECAM.update, dt)
 		if not ok then
 			warn("OS Freecam update failed:", err)
+			-- Restore player control instead of leaving a broken camera running.
+			FREECAM.stop()
 		end
 	end)
 	OS_showFreecamUi()
@@ -8124,49 +8204,27 @@ function OS_initFreecamMobileControls()
 		FREECAM.mobileDownBtn.Visible = FREECAM.enabled
 	end))
 
-	FREECAM.previousShowUi = OS_showFreecamUi
-	FREECAM.mobileShowUi = function()
-		if FREECAM.previousShowUi then
-			FREECAM.previousShowUi()
-		end
-		FREECAM.mobileUpBtn.Visible = true
-		FREECAM.mobileDownBtn.Visible = true
-	end
-
-	FREECAM.previousHideUi = OS_hideFreecamUi
-	FREECAM.mobileHideUi = function()
-		FREECAM.mobileUpBtn.Visible = false
-		FREECAM.mobileDownBtn.Visible = false
-		if FREECAM.previousHideUi then
-			FREECAM.previousHideUi()
-		end
-	end
 end
 
 function OS_initFreecamDesktopInput()
 	OS_CONNECT(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if not OS_EXEC_IS_CURRENT() then return end
 		if not FREECAM.enabled then return end
+		if gameProcessed then return end
+		if OS_isFreecamInputSuspended() then return end
 		if OS_isStrongGuiPointerInput(input) then return end
 		if input.UserInputType == Enum.UserInputType.Keyboard and not UserInputService:GetFocusedTextBox() then
 			if OS_isFreecamMouseUnlockKey(input.KeyCode) then
 				FREECAM.mouseUnlocked = not (FREECAM.mouseUnlocked == true)
 				OS_resetFreecamLookDrag()
-				if FREECAM.mouseUnlocked then
-					OS_releaseFreecamMouse()
-				end
+				OS_applyFreecamMouseState()
 				return
 			end
 			if gameProcessed then return end
 			OS_setFreecamMoveKey(input.KeyCode, true)
 			return
 		end
-		OS_beginFreecamLookDrag(input)
-	end))
-	OS_CONNECT(UserInputService.InputChanged:Connect(function(input)
-		if not OS_EXEC_IS_CURRENT() then return end
-		if not FREECAM.enabled then return end
-		OS_updateFreecamLookDrag(input)
+		if not gameProcessed then OS_beginFreecamLookDrag(input) end
 	end))
 	OS_CONNECT(UserInputService.InputEnded:Connect(function(input)
 		if not OS_EXEC_IS_CURRENT() then return end
@@ -8181,9 +8239,44 @@ function OS_initFreecamDesktopInput()
 	end))
 end
 
+function OS_initFreecamFocusInput()
+	local function cancelInput()
+		OS_resetFreecamLookDrag()
+		OS_resetFreecamMoveState()
+		FREECAM.moveUp = false
+		FREECAM.moveDown = false
+		FREECAM.lookTouch = nil
+		FREECAM.lookTouchPos = nil
+		if FREECAM.enabled then OS_releaseFreecamMouse() end
+	end
+	OS_CONNECT(UserInputService.WindowFocusReleased:Connect(function()
+		if not OS_EXEC_IS_CURRENT() then return end
+		FREECAM.windowFocused = false
+		cancelInput()
+	end))
+	OS_CONNECT(UserInputService.WindowFocused:Connect(function()
+		if not OS_EXEC_IS_CURRENT() then return end
+		FREECAM.windowFocused = true
+		cancelInput()
+	end))
+	OS_CONNECT(UserInputService.TextBoxFocused:Connect(function()
+		if OS_EXEC_IS_CURRENT() then cancelInput() end
+	end))
+	OS_CONNECT(GuiService.MenuOpened:Connect(function()
+		if not OS_EXEC_IS_CURRENT() then return end
+		FREECAM.menuOpen = true
+		cancelInput()
+	end))
+	OS_CONNECT(GuiService.MenuClosed:Connect(function()
+		if not OS_EXEC_IS_CURRENT() then return end
+		FREECAM.menuOpen = false
+		cancelInput()
+	end))
+end
+
 function OS_buildFreecamUiContent()
 	OS_freecamHeader("FREE CAM")
-	OS_freecamNote("Free-cam settings are saved for this experience and reset visually when you exit.")
+	OS_freecamNote("Press Shift to free the mouse. Hold right click outside this menu to look; release to free it. Visual changes are restored when you exit.")
 	FREECAM.speedInfoLabel = OS_freecamNote("Current move speed: " .. tostring(OS_getFreecamSpeed()))
 	OS_freecamPill("Disable Free Cam", function()
 		FREECAM.stop()
@@ -8233,6 +8326,14 @@ function OS_initFreecamState(lighting, isMobile: boolean)
 	FREECAM.moveUp = false
 	FREECAM.moveDown = false
 	FREECAM.mouseUnlocked = false
+	FREECAM.windowFocused = true
+	FREECAM.menuOpen = GuiService.MenuIsOpen
+	FREECAM.disabledControls = nil
+	FREECAM.mobileShowUi = nil
+	FREECAM.mobileHideUi = nil
+	FREECAM.previousShowUi = nil
+	FREECAM.previousHideUi = nil
+	FREECAM.renderBindName = ("OSFreecamUpdate_%s_%s"):format(LocalPlayer.UserId, tostring(OS_EXEC_ID))
 	OS_resetFreecamLookDrag()
 	FREECAM.moveState = FREECAM.moveState or {
 		forward = false,
@@ -8297,6 +8398,7 @@ resetMainBtn.Size = UDim2.new(1, -((FULL_WIDTH_INSET * 2) + S(24)), 0, BUTTON_HE
 end
 
 OS_initFreecamState(game:GetService("Lighting"), UserInputService.TouchEnabled and not UserInputService.MouseEnabled)
+OS_initFreecamFocusInput()
 if UserInputService.TouchEnabled and not UserInputService.MouseEnabled then
 	OS_initFreecamMobileControls()
 else
@@ -9107,6 +9209,7 @@ end
 -- =========================
 OS_CONFIG_FOLDER = "Fracture"
 OS_CONFIG_FILE = OS_CONFIG_FOLDER .. "/config.json"
+OS_PRESETS_FILE = OS_CONFIG_FOLDER .. "/presets.json"
 OS_AUTORUN_FILE = OS_CONFIG_FOLDER .. "/autorun.lua"
 OS_CONFIG_STATUS_LABEL = nil
 OS_CONFIG_CODE_BOX = nil
@@ -9117,6 +9220,7 @@ local OS_CONFIG_RUNTIME = { ready = false, applying = false, autoSaveBlocked = f
 local setSavedPos, setMinimized
 local MINIMIZED = true
 local OS_SAVED_PANEL_POS
+local OS_PRESETS = { store = { version = 1, nextId = 0, items = {} }, loaded = false, busy = false }
 
 function OS_configStatus(message: string)
 	if OS_CONFIG_STATUS_LABEL then
@@ -9450,8 +9554,8 @@ function OS_captureConfig()
 			aim = aimEnabled,
 			noclip = noclipEnabled,
 			invis = type(getgenv()._osInspectorIntegratedInvis) == "table" and getgenv()._osInspectorIntegratedInvis.on == true,
-			walkSpeed = walkSpeedEnabled,
-			fly = flyEnabled,
+			walkSpeed = walkSpeedEnabled or (FREECAM.enabled and FREECAM.previousWalkEnabled == true),
+			fly = flyEnabled or (FREECAM.enabled and FREECAM.previousFlyEnabled == true),
 			infiniteJump = infiniteJumpEnabled,
 			jumpPower = jumpPowerEnabled,
 			fling = flingEnabled,
@@ -9634,7 +9738,7 @@ function OS_expandConfig(config)
 	if type(config) ~= "table" then
 		return config
 	end
-	if config.arms or config.active or config.aim or config.player or config.binds then
+	if config.arms or config.active or config.aim or config.player or config.binds or config.ui or config.pov or config.freecam or config.hitbox or config.playerTools then
 		return config
 	end
 	local arms = type(config.a) == "table" and config.a or {}
@@ -9675,6 +9779,8 @@ local function OS_applyConfigValues(config)
 		return false, "Config is not valid"
 	end
 	config = OS_expandConfig(config)
+	-- Release freecam's feature suspension before restoring a different config.
+	if FREECAM.enabled then FREECAM.stop(false) end
 
 	local arms = type(config.arms) == "table" and config.arms or {}
 	espArmed = arms.esp == true
@@ -9822,19 +9928,7 @@ local function OS_applyConfigValues(config)
 
 	local freecam = type(config.freecam) == "table" and config.freecam or {}
 	if FREECAM and type(FREECAM.settings) == "table" and type(freecam.settings) == "table" then
-		for key, value in pairs(freecam.settings) do
-			if FREECAM.settings[key] ~= nil then
-				FREECAM.settings[key] = value
-			end
-		end
-		for _, refresh in ipairs(FREECAM.refreshUi or {}) do
-			pcall(refresh)
-		end
-		if freecam.enabled == true and type(FREECAM.start) == "function" then
-			FREECAM.start()
-		elseif freecam.enabled == false and FREECAM.enabled and type(FREECAM.stop) == "function" then
-			FREECAM.stop(false)
-		end
+		OS_applyFreecamSettings(freecam.settings)
 	end
 
 	local ui = type(config.ui) == "table" and config.ui or {}
@@ -9879,6 +9973,8 @@ local function OS_applyConfigValues(config)
 	OS_refreshConfigBindButtons()
 
 	if refreshAimModeUi then refreshAimModeUi() end
+	-- Start only after all movement and player-tool settings have been restored.
+	if freecam.enabled == true then FREECAM.start() end
 	pulseUI()
 	return true, "Config loaded"
 end
@@ -10013,8 +10109,14 @@ function OS_decodeConfig(text: string)
 	local ok, decoded = pcall(function()
 		return HttpService:JSONDecode(text)
 	end)
-	if ok then
-		return OS_expandConfig(decoded)
+	if ok and type(decoded) == "table" then
+		-- Valid JSON alone is not a settings file. In particular, do not turn
+		-- an empty object or unrelated JSON into defaults and then auto-save it.
+		for _, key in ipairs({ "arms", "active", "aim", "hitbox", "player", "pov", "freecam", "ui", "playerTools", "binds", "a", "x", "m", "h", "r", "o", "c", "u", "pt", "b" }) do
+			if type(decoded[key]) == "table" then
+				return OS_expandConfig(decoded)
+			end
+		end
 	end
 	return nil
 end
@@ -10333,6 +10435,207 @@ function OS_configPill(text: string, order: number, callback)
 	return btn
 end
 
+function OS_presetStatus(message)
+	if OS_PRESETS.statusLabel then OS_PRESETS.statusLabel.Text = message end
+end
+
+function OS_findPreset(id)
+	for index, preset in ipairs(OS_PRESETS.store.items) do
+		if preset.id == id then return preset, index end
+	end
+	return nil
+end
+
+function OS_writePresetStore(candidate)
+	if not OS_EXEC_IS_CURRENT() or not OS_CONFIG_RUNTIME.ready or not OS_PRESETS.loaded or OS_PRESETS.busy then
+		return false, "Saved configs are not ready"
+	end
+	if not OS_hasFileApi() then return false, "This executor does not support saving configs to disk" end
+	OS_PRESETS.busy = true
+	local ok, err = pcall(function()
+		if not OS_ensureConfigFolder() then error("Could not create config folder") end
+		writefile(OS_PRESETS_FILE, HttpService:JSONEncode(candidate))
+	end)
+	OS_PRESETS.busy = false
+	if not ok then return false, "Could not save configs: " .. tostring(err) end
+	-- Commit only after the disk write succeeds, including removals/updates.
+	OS_PRESETS.store = candidate
+	return true
+end
+
+function OS_loadPresetStore()
+	local ok, decoded = pcall(function()
+		if not OS_hasFileApi() or not isfile(OS_PRESETS_FILE) then
+			return { version = 1, nextId = 0, items = {} }
+		end
+		local store = HttpService:JSONDecode(readfile(OS_PRESETS_FILE))
+		if type(store) ~= "table" or store.version ~= 1 or type(store.items) ~= "table" then
+			error("Invalid saved config library")
+		end
+		local ids = {}
+		local nextId = 0
+		for _, preset in ipairs(store.items) do
+			if type(preset) ~= "table" or type(preset.id) ~= "string" or not preset.id:match("^%d+$")
+				or type(preset.name) ~= "string" or preset.name == "" or type(preset.config) ~= "table" or ids[preset.id] then
+				error("Invalid saved config entry")
+			end
+			ids[preset.id] = true
+			nextId = math.max(nextId, tonumber(preset.id))
+			if not OS_decodeConfig(HttpService:JSONEncode(preset.config)) then error("Invalid settings in " .. preset.name) end
+		end
+		store.nextId = math.max(nextId, tonumber(store.nextId) or 0)
+		if store.nextId == math.huge or store.nextId ~= math.floor(store.nextId) then error("Invalid config ID counter") end
+		return store
+	end)
+	if not ok then
+		OS_PRESETS.loaded = false
+		OS_presetStatus("Could not load saved configs; existing library kept: " .. tostring(decoded))
+		return false
+	end
+	OS_PRESETS.store = decoded
+	OS_PRESETS.loaded = true
+	OS_refreshPresetList()
+	if not OS_hasFileApi() then OS_presetStatus("Saving presets requires executor file support. Code import/export is still available.") end
+	return true
+end
+
+function OS_saveNamedPreset()
+	if not OS_CONFIG_RUNTIME.ready or OS_CONFIG_RUNTIME.applying then
+		OS_presetStatus("Wait until settings have finished loading")
+		return false
+	end
+	local name = OS_trimConfigText(OS_PRESETS.nameBox and OS_PRESETS.nameBox.Text or "")
+	if name == "" then OS_presetStatus("Give this config a name first") return false end
+	if #name > 64 then OS_presetStatus("Use a name of 64 characters or fewer") return false end
+	local selected = OS_PRESETS.selectedId and OS_findPreset(OS_PRESETS.selectedId)
+	for _, preset in ipairs(OS_PRESETS.store.items) do
+		if preset.name:lower() == name:lower() and preset ~= selected then
+			OS_presetStatus("That name is already used. Choose another name or load that config to update it.")
+			return false
+		end
+	end
+	local captured, config = pcall(function() return OS_compactConfig(OS_captureConfig()) end)
+	if not captured then OS_presetStatus("Could not capture settings: " .. tostring(config)) return false end
+	local candidate = { version = 1, nextId = OS_PRESETS.store.nextId, items = {} }
+	if not selected then candidate.nextId += 1 end
+	local id = selected and selected.id or tostring(candidate.nextId)
+	local entry = { id = id, name = name, config = config }
+	for _, preset in ipairs(OS_PRESETS.store.items) do
+		table.insert(candidate.items, preset.id == id and entry or preset)
+	end
+	if not selected then table.insert(candidate.items, entry) end
+	local ok, message = OS_writePresetStore(candidate)
+	if not ok then OS_presetStatus(message) return false end
+	OS_PRESETS.selectedId = id
+	OS_PRESETS.nameBox.Text = name
+	OS_refreshPresetList()
+	OS_presetStatus("Saved " .. name .. ". Click its name to load; Save Config updates the selected preset.")
+	return true
+end
+
+function OS_loadNamedPreset(id)
+	local preset = OS_findPreset(id)
+	if not preset then return false end
+	local ok, message = OS_applyConfig(preset.config)
+	if not ok then OS_presetStatus(message or "Could not load config") return false end
+	OS_PRESETS.selectedId = id
+	OS_PRESETS.nameBox.Text = preset.name
+	OS_refreshPresetList()
+	OS_presetStatus("Loaded " .. preset.name .. ". Adjust settings, then Save Config to update it.")
+	OS_saveConfigToFile(true)
+	return true
+end
+
+function OS_removeNamedPreset(id)
+	local preset = OS_findPreset(id)
+	if not preset then return false end
+	local candidate = { version = 1, nextId = OS_PRESETS.store.nextId, items = {} }
+	for _, entry in ipairs(OS_PRESETS.store.items) do
+		if entry.id ~= id then table.insert(candidate.items, entry) end
+	end
+	local ok, message = OS_writePresetStore(candidate)
+	if not ok then OS_presetStatus(message) return false end
+	if OS_PRESETS.selectedId == id then
+		OS_PRESETS.selectedId = nil
+		OS_PRESETS.nameBox.Text = ""
+	end
+	OS_refreshPresetList()
+	OS_presetStatus("Removed " .. preset.name)
+	return true
+end
+
+function OS_refreshPresetList()
+	if not OS_PRESETS.list then return end
+	for _, child in ipairs(OS_PRESETS.list:GetChildren()) do
+		if child:IsA("GuiObject") then
+			for _, descendant in ipairs(child:GetDescendants()) do dragBlockTargets[descendant] = nil end
+			child:Destroy()
+		end
+	end
+	for order, preset in ipairs(OS_PRESETS.store.items) do
+		local id = preset.id
+		local row = mk("Frame", {
+			LayoutOrder = order, Size = UDim2.new(1, 0, 0, S(34)),
+			BackgroundTransparency = 1, ZIndex = 53, Parent = OS_PRESETS.list,
+		})
+		local loadButton = mk("TextButton", {
+			Size = UDim2.new(1, -S(90), 1, 0), BackgroundColor3 = THEME_CARD_ALT,
+			Text = (OS_PRESETS.selectedId == id and "> " or "") .. preset.name,
+			TextTruncate = Enum.TextTruncate.AtEnd, Font = Enum.Font.GrenzeGotisch,
+			TextSize = S(22), TextColor3 = THEME_TEXT, AutoButtonColor = false,
+			ZIndex = 54, Parent = row,
+		})
+		local removeButton = mk("TextButton", {
+			Size = UDim2.fromOffset(S(82), S(34)), Position = UDim2.new(1, -S(82), 0, 0),
+			BackgroundColor3 = THEME_CARD_ALT, Text = "Remove", Font = Enum.Font.GrenzeGotisch,
+			TextSize = S(20), TextColor3 = THEME_TEXT, AutoButtonColor = false,
+			ZIndex = 54, Parent = row,
+		})
+		for _, button in ipairs({ loadButton, removeButton }) do
+			dragBlockTargets[button] = true
+			mk("UICorner", { CornerRadius = UDim.new(0, S(10)), Parent = button })
+			mk("UIStroke", { Thickness = 1, Color = THEME_STROKE, Transparency = 0.25, Parent = button })
+			addHover(button)
+		end
+		loadButton.MouseButton1Click:Connect(function() OS_loadNamedPreset(id) end)
+		removeButton.MouseButton1Click:Connect(function() OS_removeNamedPreset(id) end)
+	end
+	if #OS_PRESETS.store.items == 0 then OS_presetStatus("No saved configs yet. Click Add Config to create one.") end
+end
+
+function OS_buildPresetControls()
+	OS_configHeader("SAVED CONFIGS", 9)
+	OS_PRESETS.statusLabel = mk("TextLabel", {
+		LayoutOrder = 10, Size = UDim2.new(1, 0, 0, S(48)), BackgroundTransparency = 1,
+		Text = "Add a config, name it, adjust your settings in any tab, then Save Config. You can also import a code before saving.",
+		TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left,
+		Font = Enum.Font.GrenzeGotisch, TextSize = S(18), TextColor3 = THEME_MUTED,
+		ZIndex = 54, Parent = pageConfig,
+	})
+	OS_configPill("Add Config", 11, function()
+		OS_PRESETS.selectedId = nil
+		OS_PRESETS.nameBox.Text = ""
+		OS_refreshPresetList()
+		OS_presetStatus("Name the new config, adjust settings in any tab, then click Save Config.")
+		OS_PRESETS.nameBox:CaptureFocus()
+	end)
+	OS_PRESETS.nameBox = mk("TextBox", {
+		LayoutOrder = 12, Size = UDim2.new(1, -S(8), 0, S(34)), BackgroundColor3 = THEME_INPUT,
+		Text = "", PlaceholderText = "Config name", ClearTextOnFocus = false, MultiLine = false,
+		Font = Enum.Font.GrenzeGotisch, TextSize = S(22), TextColor3 = THEME_TEXT,
+		PlaceholderColor3 = THEME_MUTED, ZIndex = 54, Parent = pageConfig,
+	})
+	dragBlockTargets[OS_PRESETS.nameBox] = true
+	mk("UICorner", { CornerRadius = UDim.new(0, S(10)), Parent = OS_PRESETS.nameBox })
+	mk("UIStroke", { Thickness = 1, Color = THEME_STROKE, Transparency = 0.25, Parent = OS_PRESETS.nameBox })
+	OS_configPill("Save Config", 13, OS_saveNamedPreset)
+	OS_PRESETS.list = mk("Frame", {
+		LayoutOrder = 14, Size = UDim2.new(1, -S(8), 0, 0), AutomaticSize = Enum.AutomaticSize.Y,
+		BackgroundTransparency = 1, ZIndex = 53, Parent = pageConfig,
+	})
+	mk("UIListLayout", { SortOrder = Enum.SortOrder.LayoutOrder, Padding = UDim.new(0, S(6)), Parent = OS_PRESETS.list })
+end
+
 function OS_buildConfigPage()
 	OS_configHeader("CONFIG", 1)
 	OS_CONFIG_STATUS_LABEL = mk("TextLabel", {
@@ -10397,6 +10700,7 @@ function OS_buildConfigPage()
 	OS_configPill("Reset Everything", 8, function()
 		OS_resetEverything()
 	end)
+	OS_buildPresetControls()
 end
 
 OS_buildConfigPage()
@@ -13941,11 +14245,6 @@ function setMinimized(on: boolean, instant: boolean?)
 					end
 				end
 			end)
-			task.delay(0.08, function()
-				if not MINIMIZED and panel.Visible and panel:GetAttribute("MinimizeToken") == transitionToken then
-					setMiniLogoTransparency(1, MINI_INFO_OPEN)
-				end
-			end)
 		end
 
 		task.delay(0.06, function()
@@ -14687,6 +14986,7 @@ end
 OS_CONFIG_RUNTIME.ready = true
 setMinimized(MINIMIZED, true)
 OS_loadConfigFromFile(true)
+OS_loadPresetStore()
 if OS_PENDING_UI_CONFIG then OS_applyUiConfig(OS_PENDING_UI_CONFIG) end
 playMiniStartupIntro()
 OS_enableTeleportAutoQueue()
