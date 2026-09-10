@@ -7458,8 +7458,12 @@ function OS_applyFreecamMouseState(): boolean
 		behavior = FREECAM.lookDragActive and Enum.MouseBehavior.LockCurrentPosition or Enum.MouseBehavior.Default
 	end
 	UserInputService.MouseBehavior = behavior
-	UserInputService.MouseIconEnabled = true
-	UserInputService.OverrideMouseIconBehavior = Enum.OverrideMouseIconBehavior.None
+	-- This cosmetic override is restricted in some callback contexts. It must
+	-- never prevent the camera movement or mouse-lock update from running.
+	pcall(function()
+		UserInputService.MouseIconEnabled = true
+		UserInputService.OverrideMouseIconBehavior = Enum.OverrideMouseIconBehavior.None
+	end)
 	return behavior ~= Enum.MouseBehavior.Default
 end
 
@@ -8060,15 +8064,21 @@ function OS_freecamStart()
 		FREECAM.connection:Disconnect()
 		FREECAM.connection = nil
 	end
-	RunService:BindToRenderStep(FREECAM.renderBindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
-		if not OS_EXEC_IS_CURRENT() or not FREECAM.enabled then
+	-- Engine-bound callbacks can run with a different global environment.
+	-- Capture this run's state and functions, rather than looking up FREECAM
+	-- inside the native callback (which can be nil even while the GUI works).
+	local freecamState = FREECAM
+	local updateFreecam = freecamState.update
+	local stopFreecam = freecamState.stop
+	RunService:BindToRenderStep(freecamState.renderBindName, Enum.RenderPriority.Camera.Value + 1, function(dt)
+		if not OS_EXEC_IS_CURRENT() or not freecamState.enabled then
 			return
 		end
-		local ok, err = pcall(FREECAM.update, dt)
+		local ok, err = pcall(updateFreecam, dt)
 		if not ok then
 			warn("OS Freecam update failed:", err)
 			-- Restore player control instead of leaving a broken camera running.
-			FREECAM.stop()
+			stopFreecam()
 		end
 	end)
 	OS_showFreecamUi()
@@ -8210,10 +8220,11 @@ function OS_initFreecamDesktopInput()
 	OS_CONNECT(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 		if not OS_EXEC_IS_CURRENT() then return end
 		if not FREECAM.enabled then return end
-		if gameProcessed then return end
 		if OS_isFreecamInputSuspended() then return end
 		if OS_isStrongGuiPointerInput(input) then return end
 		if input.UserInputType == Enum.UserInputType.Keyboard and not UserInputService:GetFocusedTextBox() then
+			-- Roblox can consume Shift for its own mouse-lock shortcut. Freecam
+			-- still owns this shortcut while active; text/menu focus is gated above.
 			if OS_isFreecamMouseUnlockKey(input.KeyCode) then
 				FREECAM.mouseUnlocked = not (FREECAM.mouseUnlocked == true)
 				OS_resetFreecamLookDrag()
