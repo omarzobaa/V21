@@ -9541,6 +9541,7 @@ function OS_captureUiConfig()
 	return {
 		activeTab = ACTIVE_TAB_KEY,
 		minimized = MINIMIZED == true,
+		chatViewEnabled = OS_CHAT_VIEW and OS_CHAT_VIEW.enabled == true,
 		panelPosition = OS_serializeUDim2(OS_SAVED_PANEL_POS or (panel and panel.Position)),
 		guiTargetFps = OS_GUI_TARGET_FPS,
 		rainbowKeypointSteps = OS_RAINBOW_KEYPOINT_STEPS,
@@ -9578,6 +9579,9 @@ function OS_applyUiConfig(uiConfig)
 	end
 	if uiConfig.minimized ~= nil then
 		setMinimized(uiConfig.minimized == true, true)
+	end
+	if OS_setChatViewEnabled then
+		OS_setChatViewEnabled(uiConfig.chatViewEnabled == true, true)
 	end
 	OS_PENDING_UI_CONFIG = nil
 end
@@ -9843,7 +9847,7 @@ function OS_compactConfig(config)
 		r = { ws = player.walkSpeed, wi = player.walkInstant, fs = player.flySpeed, b = player.brightness, jp = player.jumpPower, g = player.gravity },
 		o = { e = pov.enabled, wi = pov.wallIgnore, t = pov.transparentWalls, mn = pov.minZoom, z = pov.maxZoom, sz = pov.savedMaxZoom },
 		c = compactFreecam,
-		u = { t = ui.activeTab, m = ui.minimized, p = ui.panelPosition, gf = ui.guiTargetFps, gk = ui.rainbowKeypointSteps },
+		u = { t = ui.activeTab, m = ui.minimized, p = ui.panelPosition, gf = ui.guiTargetFps, gk = ui.rainbowKeypointSteps, cv = ui.chatViewEnabled },
 		pt = playerTools,
 		b = {
 			e = OS_compactConfigBind(binds.esp),
@@ -9883,7 +9887,7 @@ function OS_expandConfig(config)
 		player = { walkSpeed = player.ws, walkInstant = player.wi, flySpeed = player.fs, brightness = player.b, jumpPower = player.jp, gravity = player.g },
 		pov = { enabled = pov.e, wallIgnore = pov.wi, transparentWalls = pov.t, minZoom = pov.mn, maxZoom = pov.z, savedMaxZoom = pov.sz },
 		freecam = { enabled = type(config.c) == "table" and config.c.e == true, settings = OS_expandFreecamSettings(config.c) },
-		ui = { activeTab = ui.t, minimized = ui.m, panelPosition = ui.p, guiTargetFps = ui.gf, rainbowKeypointSteps = ui.gk },
+		ui = { activeTab = ui.t, minimized = ui.m, panelPosition = ui.p, guiTargetFps = ui.gf, rainbowKeypointSteps = ui.gk, chatViewEnabled = ui.cv },
 		playerTools = type(config.pt) == "table" and config.pt or {},
 		binds = {
 			esp = OS_expandConfigBind(binds.e),
@@ -10413,6 +10417,7 @@ function OS_resetEverything()
 		selectedPartName = "Head"
 	end
 	OS_resetPlayerToolsState()
+	if OS_setChatViewEnabled then OS_setChatViewEnabled(false, true) end
 	if OS_CONFIG_CODE_BOX then
 		OS_CONFIG_CODE_BOX.Text = ""
 	end
@@ -12081,6 +12086,108 @@ function OS_initPlayerToolActions(nextPlayerOrder, playerHeader, playerNote)
 	OS_playerToolsBindReturnButtons()
 end
 
+-- Re-enable Roblox's own history window; do not collect or render chat messages.
+function OS_applyNativeChatView()
+	local state = OS_CHAT_VIEW
+	if not state or not state.enabled or state.applying or not OS_EXEC_IS_CURRENT() then return end
+	state.applying = true
+	local revision = state.revision
+	local function current()
+		return state.enabled and state.revision == revision and OS_EXEC_IS_CURRENT()
+	end
+	local freecam = FREECAM and FREECAM.enabled and FREECAM or nil
+	local hiddenByFreecam = freecam and freecam.settings and freecam.settings.hideChat == true
+	pcall(function()
+		local coreEnabled = StarterGui:GetCoreGuiEnabled(Enum.CoreGuiType.Chat)
+		if not current() then return end
+		if state.coreEnabled == nil then
+			-- Freecam may temporarily hide chat. Save its pre-freecam setting.
+			state.coreEnabled = coreEnabled
+			if freecam and freecam.backup and freecam.backup.chatEnabled ~= nil then
+				state.coreEnabled = freecam.backup.chatEnabled
+			end
+		end
+		if freecam and freecam.backup then freecam.backup.chatEnabled = true end
+		if not hiddenByFreecam and not coreEnabled then
+			StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, true)
+		end
+	end)
+	pcall(function()
+		local service = game:GetService("TextChatService")
+		local window = service:FindFirstChildOfClass("ChatWindowConfiguration")
+		if not current() then return end
+		if window then
+			if state.windows[window] == nil then state.windows[window] = window.Enabled end
+			if not window.Enabled then window.Enabled = true end
+		end
+	end)
+	pcall(function()
+		-- Also open the native chat toggle, including legacy chat where available.
+		local active = StarterGui:GetCore("ChatActive")
+		if not current() then return end
+		if type(active) ~= "boolean" then return end
+		if state.chatActive == nil then state.chatActive = active end
+		if not hiddenByFreecam and not active then StarterGui:SetCore("ChatActive", true) end
+	end)
+	state.applying = false
+end
+
+function OS_restoreNativeChatView()
+	local state = OS_CHAT_VIEW
+	if not state then return end
+	for window, enabled in pairs(state.windows) do
+		pcall(function() window.Enabled = enabled end)
+	end
+	table.clear(state.windows)
+	if state.chatActive ~= nil then
+		pcall(function() StarterGui:SetCore("ChatActive", state.chatActive) end)
+		state.chatActive = nil
+	end
+	if state.coreEnabled ~= nil then
+		local enabled = state.coreEnabled
+		if FREECAM and FREECAM.enabled then
+			if FREECAM.backup then FREECAM.backup.chatEnabled = enabled end
+			if FREECAM.settings then enabled = not FREECAM.settings.hideChat end
+		end
+		pcall(function() StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Chat, enabled) end)
+		state.coreEnabled = nil
+	end
+end
+
+function OS_setChatViewEnabled(enabled: boolean, instant: boolean?)
+	local state = OS_CHAT_VIEW
+	if not state then return end
+	if state.enabled ~= (enabled == true) then state.revision += 1 end
+	state.enabled = enabled == true
+	if state.switch then state.switch.setOn(state.enabled, instant) end
+	if state.enabled then
+		OS_applyNativeChatView()
+	else
+		OS_restoreNativeChatView()
+	end
+end
+
+function OS_buildChatView(nextPlayerOrder)
+	OS_CHAT_VIEW = { enabled = false, windows = {}, revision = 0 }
+	local state = OS_CHAT_VIEW
+	state.switch = createIosSwitchRow(pagePlayer, 0, "Chat View", function()
+		OS_setChatViewEnabled(not state.enabled)
+	end)
+	state.switch.row.LayoutOrder = nextPlayerOrder()
+	state.switch.setOn(false, true)
+	dragBlockTargets[state.switch.row] = true
+	-- Retry if Roblox's chat UI loads later or a game disables it again.
+	local elapsed = 0
+	OS_CONNECT(RunService.Heartbeat:Connect(function(dt)
+		if not OS_EXEC_IS_CURRENT() or not state.enabled then elapsed = 0 return end
+		elapsed += dt
+		if elapsed < 0.5 then return end
+		elapsed = 0
+		OS_applyNativeChatView()
+	end))
+end
+
+
 function OS_initPlayerToolsState()
 	PLAYERTOOLS = PLAYERTOOLS or {}
 	PLAYERTOOLS.spectateActive = false
@@ -12774,6 +12881,7 @@ do
 	OS_buildPlayerToolCheckpoints(PLAYERTOOLS.nextPlayerOrder)
 	OS_initPlayerToolActions(PLAYERTOOLS.nextPlayerOrder, PLAYERTOOLS.playerHeader, PLAYERTOOLS.playerNote)
 	OS_buildPlayerToolFilters(PLAYERTOOLS.nextPlayerOrder, PLAYERTOOLS.playerHeader, PLAYERTOOLS.playerNote)
+	OS_buildChatView(PLAYERTOOLS.nextPlayerOrder)
 	OS_bindPlayerToolsHeartbeat()
 	if OS_PENDING_PLAYERTOOLS_CONFIG then
 		OS_applyPlayerToolsConfig(OS_PENDING_PLAYERTOOLS_CONFIG)
@@ -15041,6 +15149,9 @@ OS_EXEC_GUARD.cleanup = function()
 		if FREECAM and FREECAM.stop then
 			FREECAM.stop(false)
 		end
+	end)
+	pcall(function()
+		if OS_setChatViewEnabled then OS_setChatViewEnabled(false, true) end
 	end)
 	pcall(function()
 		OS_cancelFreecamExitMouseReset()
