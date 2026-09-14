@@ -1287,6 +1287,7 @@ do
 		transparencies = {},
 		connections = {},
 		descendantConn = nil,
+		descendantRemovingConn = nil,
 		restore = nil,
 		pendingRootCharacter = nil,
 	}
@@ -1311,38 +1312,40 @@ do
 		root.AssemblyLinearVelocity = velocity
 	end
 
-	local function getVisualModifier(baseTransparency)
-		if baseTransparency >= VISUAL_ALPHA then
-			return 0
+	local function restoreVisuals()
+		if not state.on then return end
+		for item, transparency in pairs(state.transparencies) do
+			item.Transparency = transparency
 		end
-		local denom = 1 - baseTransparency
-		if denom <= 0 then
-			return 0
-		end
-		return math.clamp(1 - ((1 - VISUAL_ALPHA) / denom), 0, 1)
 	end
 
 	local function registerVisual(item)
 		if item:IsA("BasePart") or item:IsA("Decal") then
-			state.transparencies[item] = item.Transparency
+			if state.transparencies[item] == nil then
+				state.transparencies[item] = item.Transparency
+			end
 			if state.on then
-				if item:IsA("BasePart") then
-					item.LocalTransparencyModifier = getVisualModifier(item.Transparency)
-				else
-					item.Transparency = math.max(item.Transparency, VISUAL_ALPHA)
-				end
+				item.Transparency = math.max(state.transparencies[item], VISUAL_ALPHA)
 			end
 		end
 	end
 
+	local function unregisterVisual(item)
+		local transparency = state.transparencies[item]
+		if transparency ~= nil then
+			if state.on then item.Transparency = transparency end
+			state.transparencies[item] = nil
+		end
+	end
+
 	local function apply()
+		if not state.on then return end
+		-- Roblox owns LocalTransparencyModifier for first-person hiding and only
+		-- updates it when its camera fade changes. Keep our local ghost effect on
+		-- Transparency so repeated applies cannot reveal the head or accessories.
 		for item, transparency in pairs(state.transparencies) do
 			if item and item.Parent then
-				if item:IsA("BasePart") then
-					item.LocalTransparencyModifier = state.on and getVisualModifier(transparency) or 0
-				else
-					item.Transparency = state.on and math.max(transparency, VISUAL_ALPHA) or transparency
-				end
+				item.Transparency = math.max(transparency, VISUAL_ALPHA)
 			end
 		end
 	end
@@ -1356,6 +1359,12 @@ do
 	end
 
 	local function refresh(characterOverride)
+		-- Restore before re-registering, including refreshes of the same character.
+		-- Otherwise the ghost alpha would become the new saved original value.
+		restoreVisuals()
+		if state.restore and live() then
+			state.root.CFrame = state.restore
+		end
 		local character = characterOverride or player.Character
 		state.character = character
 		state.root = nil
@@ -1364,6 +1373,10 @@ do
 		if state.descendantConn then
 			state.descendantConn:Disconnect()
 			state.descendantConn = nil
+		end
+		if state.descendantRemovingConn then
+			state.descendantRemovingConn:Disconnect()
+			state.descendantRemovingConn = nil
 		end
 
 		table.clear(state.transparencies)
@@ -1397,6 +1410,7 @@ do
 			registerVisual(item)
 		end
 		state.descendantConn = character.DescendantAdded:Connect(registerVisual)
+		state.descendantRemovingConn = character.DescendantRemoving:Connect(unregisterVisual)
 
 		if state.on then wakeRootForReplication() end
 		apply()
@@ -1408,6 +1422,14 @@ do
 			return
 		end
 
+		if on then
+			-- Values may have changed while invisibility was off.
+			for item in pairs(state.transparencies) do
+				state.transparencies[item] = item.Transparency
+			end
+		else
+			restoreVisuals()
+		end
 		state.on = on
 
 		if not on and state.restore and live() then
@@ -1448,15 +1470,11 @@ do
 			end)
 			state.descendantConn = nil
 		end
-
-		for item, transparency in pairs(state.transparencies) do
-			if item and item.Parent then
-				if item:IsA("BasePart") then
-					item.LocalTransparencyModifier = 0
-				else
-					item.Transparency = transparency
-				end
-			end
+		if state.descendantRemovingConn then
+			pcall(function()
+				state.descendantRemovingConn:Disconnect()
+			end)
+			state.descendantRemovingConn = nil
 		end
 		table.clear(state.transparencies)
 
