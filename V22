@@ -252,12 +252,8 @@ HIGHLIGHT_NAME = "AnomalyESP_Highlight"
 AIM_SMOOTHNESS_SLIDER_MAX = 10
 AIM_SMOOTHNESS_INPUT_MAX = 10
 AIM_MOUSE_RADIUS = 400
-AIM_MOUSE_SETTLE_RADIUS = .1
-AIM_MOUSE_RESPONSE_FLOOR = 0.1
-AIM_MOUSE_RESPONSE_CEILING = 1
-AIM_MOUSE_CATCHUP_DISTANCE = 42
-AIM_MOUSE_REVERSAL_BRAKE = .30
-AIM_MOUSE_FORCE_STEP_DISTANCE = 2
+AIM_MOUSE_PIXEL_HYSTERESIS = 0.125
+AIM_MOUSE_GAIN_MIN_SAMPLES = 3
 MAX_RAY_DISTANCE = 1000
 MAX_SNAP_TO_RAY = 8
 AIM_PREDICTION_SLIDER_MAX = 500
@@ -335,8 +331,7 @@ local dragBlockTargets = {} :: { [Instance]: boolean }
 local targetPart: BasePart? = nil
 local targetModel: Model? = nil
 local targetPlayer: Player? = nil
-local aimMouseCarry = Vector2.zero
-local aimMouseLastDelta: Vector2? = nil
+local aimMouseState = {}
 local selectedPartName = "Head"
 local aimControlMode = "Camera"
 local refreshAimModeUi
@@ -1455,7 +1450,7 @@ do
 		end)
 
 		pcall(function()
-			RunService:UnbindToRenderStep(BIND_NAME)
+			RunService:UnbindFromRenderStep(BIND_NAME)
 		end)
 
 		for _, connection in ipairs(state.connections) do
@@ -1653,7 +1648,7 @@ local function getAimCandidatePart(model: Model, preferredName: string): BasePar
 		or getCharPart(model, "LowerTorso")
 end
 
-function getPredictedAimPosition(part: BasePart): Vector3
+local function getPredictedAimPosition(part: BasePart): Vector3
 	if not aimPredictionEnabled or aimPredictionValue <= 0 then
 		return part.Position
 	end
@@ -1688,26 +1683,17 @@ local function getAimSmoothnessAlpha(dt: number?): number
 end
 
 local function getMouseViewportPosition(): Vector2
-	local topLeftInset = select(1, GuiService:GetGuiInset())
-	return UserInputService:GetMouseLocation() - topLeftInset
+	-- Match WorldToViewportPoint: both use the viewport origin, including the top bar.
+	return UserInputService:GetMouseLocation()
 end
 
 local function worldToAimScreenPoint(worldPosition: Vector3, allowOffscreen: boolean?): (Vector2?, boolean)
-	local screenPos, onScreen = Camera:WorldToScreenPoint(worldPosition)
+	local screenPos, onScreen = Camera:WorldToViewportPoint(worldPosition)
 	if screenPos.Z <= 0 then
 		return nil, false
 	end
 	if not onScreen and not allowOffscreen then
 		return nil, false
-	end
-
-	local cameraSpace = Camera.CFrame:PointToObjectSpace(worldPosition)
-	if cameraSpace.Z > 0 then
-		screenPos = Vector3.new(
-			Camera.ViewportSize.X - screenPos.X,
-			Camera.ViewportSize.Y - screenPos.Y,
-			screenPos.Z
-		)
 	end
 
 	return Vector2.new(screenPos.X, screenPos.Y), onScreen
@@ -1748,8 +1734,7 @@ local function isAimTargetPartValid(part: BasePart?): boolean
 end
 
 local function resetAimMouseController()
-	aimMouseCarry = Vector2.zero
-	aimMouseLastDelta = nil
+	table.clear(aimMouseState)
 end
 
 local function clearAimTarget()
@@ -1774,77 +1759,203 @@ local function setAimTarget(part: BasePart?): BasePart?
 	return targetPart
 end
 
--- Mouse-lock rides Roblox's own cursor behavior, so zoom/camera state naturally
--- becomes the "center vs free mouse" switch without extra mode toggles.
-local function getAimLockScreenPoint(part: BasePart): (Vector2?, Vector3?)
-	local aimPosition = getPredictedAimPosition(part)
-	local aimScreenPoint = worldToAimScreenPoint(aimPosition, true)
-	return aimScreenPoint, aimPosition
+local function quantizeMouseAxis(value: number, previous: number?): number
+	-- Spatial hysteresis prevents half-pixel projection noise from alternating
+	-- between two integer positions. No target history is averaged or delayed.
+	if previous and math.abs(value - previous) <= 0.5 + AIM_MOUSE_PIXEL_HYSTERESIS then
+		return previous
+	end
+	return math.floor(value + 0.5)
 end
 
-local function quantizeMouseAxis(value: number): number
-	if value > 0 then
-		return math.floor(value)
-	end
-	if value < 0 then
-		return math.ceil(value)
-	end
-	return 0
+local function getAimMouseRayAngles(screenPoint: Vector2): Vector2
+	local direction = Camera:ViewportPointToRay(screenPoint.X, screenPoint.Y).Direction.Unit
+	return Vector2.new(math.atan2(direction.X, -direction.Z), -math.asin(math.clamp(direction.Y, -1, 1)))
 end
 
-local function nudgeMouseToward(screenPoint: Vector2, dt: number?): boolean
-	if type(mousemoverel) ~= "function" then
-		return false
+local function getAimMouseAngleDelta(current: Vector2, previous: Vector2): Vector2
+	local yaw = (current.X - previous.X + math.pi) % (2 * math.pi) - math.pi
+	return Vector2.new(yaw, current.Y - previous.Y)
+end
+
+local function observeAimMouseGain(axis, sent: number, observed: number, angular: boolean)
+	-- Match measured cursor/camera movement to sent input, including input that
+	-- arrives a few frames late. Target motion is absent from this fit.
+	local minGain, maxGain = angular and 0.00001 or 0.05, angular and 0.1 or 20
+	local history = axis.history
+	if not history then history = {}; axis.history = history end
+	table.insert(history, { sent = sent, observed = observed })
+	if #history > 12 then table.remove(history, 1) end
+	if angular and math.abs(observed) > math.rad(60) then
+		table.clear(history)
+		return
 	end
 
-	local mousePos = getMouseViewportPosition()
-	local mouseDelta = screenPoint - mousePos
-	local distance = mouseDelta.Magnitude
-	if distance <= AIM_MOUSE_SETTLE_RADIUS then
-		aimMouseCarry = Vector2.zero
-		aimMouseLastDelta = mouseDelta
-		return true
-	end
-
-	local smoothnessAlpha = getAimSmoothnessAlpha(dt)
-	local baseAlpha = AIM_MOUSE_RESPONSE_FLOOR + ((AIM_MOUSE_RESPONSE_CEILING - AIM_MOUSE_RESPONSE_FLOOR) * smoothnessAlpha)
-	local catchUpAlpha = math.clamp((distance - AIM_MOUSE_SETTLE_RADIUS) / AIM_MOUSE_CATCHUP_DISTANCE, 0, 1)
-	local moveAlpha = math.clamp(
-		baseAlpha + ((AIM_MOUSE_RESPONSE_CEILING - baseAlpha) * catchUpAlpha),
-		AIM_MOUSE_RESPONSE_FLOOR,
-		AIM_MOUSE_RESPONSE_CEILING
-	)
-
-	if aimMouseLastDelta and aimMouseLastDelta:Dot(mouseDelta) <= 0 then
-		moveAlpha = math.min(moveAlpha, AIM_MOUSE_REVERSAL_BRAKE)
-	end
-
-	if moveAlpha <= 0.01 then
-		aimMouseCarry = Vector2.zero
-		aimMouseLastDelta = mouseDelta
-		return true
-	end
-
-	local moveX = quantizeMouseAxis(mouseDelta.X * moveAlpha)
-	local moveY = quantizeMouseAxis(mouseDelta.Y * moveAlpha)
-
-	if moveX == 0 and moveY == 0 then
-		aimMouseCarry = Vector2.zero
-		if distance >= AIM_MOUSE_FORCE_STEP_DISTANCE then
-			if math.abs(mouseDelta.X) >= math.abs(mouseDelta.Y) then
-				moveX = mouseDelta.X >= 0 and 1 or -1
-			else
-				moveY = mouseDelta.Y >= 0 and 1 or -1
-			end
-		else
-			aimMouseLastDelta = mouseDelta
-			return true
+	-- Before a reliable fit exists, a large positive measured response can only
+	-- reduce the next command. Never amplify input from one partial/delayed sample.
+	if not axis.calibrated and math.abs(sent) >= 2 then
+		local sample = observed / sent
+		if sample > (axis.gain or axis.referenceGain or math.huge) * 1.15 and sample <= maxGain then
+			axis.gain = sample
 		end
 	end
 
-	aimMouseCarry = Vector2.zero
-	mousemoverel(moveX, moveY)
-	aimMouseLastDelta = mouseDelta
+	local bestGain, bestDelay, bestError
+	for delay = 0, 3 do
+		local xx, xy, yy, useful = 0, 0, 0, 0
+		for i = 1 + delay, #history do
+			local x, y = history[i - delay].sent, history[i].observed
+			xx += x * x
+			xy += x * y
+			yy += y * y
+			if math.abs(x) >= 2 then useful += 1 end
+		end
+		if #history - delay >= 6 and useful >= AIM_MOUSE_GAIN_MIN_SAMPLES and xx > 0 and yy > 0 then
+			local gain = xy / xx
+			local error = math.sqrt(math.max(0, yy - xy * xy / xx) / yy)
+			if math.abs(gain) >= minGain and math.abs(gain) <= maxGain
+				and error <= 0.03 and (not bestError or error < bestError - 0.00001) then
+				bestGain, bestDelay, bestError = gain, delay, error
+			end
+		end
+	end
+	if bestGain then
+		axis.gain, axis.delay, axis.fitError = bestGain, bestDelay, bestError
+		axis.calibrated = true
+	end
+end
+
+local function getAimMousePendingInput(axis): number
+	local pending = 0
+	local history = axis.history
+	if history and axis.calibrated then
+		for i = math.max(1, #history - axis.delay + 1), #history do
+			pending += history[i].sent
+		end
+	end
+	return pending
+end
+
+local function quantizeAimMouseInput(axis, input: number, alpha: number): number
+	if math.abs(input) <= 0.5 + AIM_MOUSE_PIXEL_HYSTERESIS then
+		axis.carry = 0
+		return 0
+	end
+	if alpha >= 1 then
+		axis.carry = 0
+		return quantizeMouseAxis(input)
+	end
+	local carry = axis.carry or 0
+	if carry * input < 0 then carry = 0 end
+	local desired = input * alpha + carry
+	local command = quantizeMouseAxis(desired)
+	axis.carry = desired - command
+	return command
+end
+
+local function traceAimMouse(screenPoint: Vector2, mousePos: Vector2, command: Vector2, response: Vector2, alpha: number, status: string, dt: number?)
+	local env = getgenv()
+	if env.FractureMouseAimTraceEnabled ~= true then return end
+	local trace = env.FractureMouseAimTrace
+	if type(trace) ~= "table" then
+		trace = { samples = {}, nextIndex = 1, count = 0 }
+		env.FractureMouseAimTrace = trace
+	end
+	local state = aimMouseState
+	trace.samples[trace.nextIndex] = {
+		time = os.clock(), dt = dt, status = status, behavior = UserInputService.MouseBehavior.Name,
+		target = { screenPoint.X, screenPoint.Y }, cursor = { mousePos.X, mousePos.Y },
+		command = { command.X, command.Y },
+		previousCommand = state.lastCommand and { state.lastCommand.X, state.lastCommand.Y } or { 0, 0 },
+		response = { response.X, response.Y }, responseUnits = state.locked and "radians" or "pixels",
+		alpha = alpha, gainX = state.x and state.x.gain, gainY = state.y and state.y.gain,
+		delayX = state.x and state.x.delay, delayY = state.y and state.y.delay,
+		fitErrorX = state.x and state.x.fitError, fitErrorY = state.y and state.y.fitError,
+		mouseDeltaSensitivity = UserInputService.MouseDeltaSensitivity,
+	}
+	trace.nextIndex = trace.nextIndex % 240 + 1
+	trace.count = math.min(trace.count + 1, 240)
+end
+
+local function nudgeMouseToward(screenPoint: Vector2, dt: number?): boolean
+	local mousePos = getMouseViewportPosition()
+	local behavior = UserInputService.MouseBehavior
+	local locked = behavior ~= Enum.MouseBehavior.Default
+	local state = aimMouseState
+	if state.camera ~= Camera or state.behavior ~= behavior
+		or state.viewport ~= Camera.ViewportSize or state.fov ~= Camera.FieldOfView
+		or state.sensitivity ~= UserInputService.MouseDeltaSensitivity or (dt and dt > 0.1) then
+		resetAimMouseController()
+		state.camera, state.behavior = Camera, behavior
+		state.viewport, state.fov = Camera.ViewportSize, Camera.FieldOfView
+		state.sensitivity, state.locked = UserInputService.MouseDeltaSensitivity, locked
+		state.x, state.y = {}, {}
+	end
+
+	local alpha = getAimSmoothnessAlpha(dt)
+	if type(mousemoverel) ~= "function" then
+		traceAimMouse(screenPoint, mousePos, Vector2.zero, Vector2.zero, alpha, "mousemoverel unavailable", dt)
+		resetAimMouseController()
+		return false
+	end
+
+	local mouseDelta = screenPoint - mousePos
+	local response = Vector2.zero
+	local command
+	local angles
+	if locked then
+		-- LockCurrentPosition uses the real cursor anchor, including off-center
+		-- anchors. This reads camera response and never writes Camera.CFrame.
+		angles = getAimMouseRayAngles(mousePos)
+		local errorAngles = getAimMouseAngleDelta(getAimMouseRayAngles(screenPoint), angles)
+		state.x.referenceGain = math.abs(mouseDelta.X) > 0.001 and math.abs(errorAngles.X / mouseDelta.X) or nil
+		state.y.referenceGain = math.abs(mouseDelta.Y) > 0.001 and math.abs(errorAngles.Y / mouseDelta.Y) or nil
+		if state.lastAngles and state.lastCommand and state.lastMouse == mousePos then
+			response = getAimMouseAngleDelta(angles, state.lastAngles)
+			observeAimMouseGain(state.x, state.lastCommand.X, response.X, true)
+			observeAimMouseGain(state.y, state.lastCommand.Y, response.Y, true)
+		end
+		-- Use measured input units and subtract commands still in transit. Until
+		-- response is known, retain pixel-relative input with overshoot correction.
+		local inputX = state.x.gain and (errorAngles.X / state.x.gain - getAimMousePendingInput(state.x)) or mouseDelta.X
+		local inputY = state.y.gain and (errorAngles.Y / state.y.gain - getAimMousePendingInput(state.y)) or mouseDelta.Y
+		command = Vector2.new(quantizeAimMouseInput(state.x, inputX, alpha), quantizeAimMouseInput(state.y, inputY, alpha))
+	else
+		state.x.referenceGain, state.y.referenceGain = 1, 1
+		if state.lastMouse and state.lastCommand then
+			response = mousePos - state.lastMouse
+			observeAimMouseGain(state.x, state.lastCommand.X, response.X, false)
+			observeAimMouseGain(state.y, state.lastCommand.Y, response.Y, false)
+		end
+		-- Keep a continuous acquisition position so integer mouse output cannot
+		-- stall smoothing short of the target. Add current target displacement
+		-- directly: movement does not accumulate an artificial trailing gap.
+		local targetMotion = state.lastScreenPoint and screenPoint - state.lastScreenPoint or Vector2.zero
+		local virtual = (state.virtualPoint or mousePos) + targetMotion
+		local desired = alpha >= 1 and screenPoint or virtual + (screenPoint - virtual) * alpha
+		local previous = state.endpoint
+		local endpoint = Vector2.new(
+			quantizeMouseAxis(desired.X, previous and previous.X),
+			quantizeMouseAxis(desired.Y, previous and previous.Y)
+		)
+		local inputX = (endpoint.X - mousePos.X) / (state.x.gain or 1) - getAimMousePendingInput(state.x)
+		local inputY = (endpoint.Y - mousePos.Y) / (state.y.gain or 1) - getAimMousePendingInput(state.y)
+		command = Vector2.new(quantizeAimMouseInput(state.x, inputX, 1), quantizeAimMouseInput(state.y, inputY, 1))
+		state.endpoint, state.virtualPoint = endpoint, desired
+	end
+
+	local sent = command.X ~= 0 or command.Y ~= 0
+	if sent then
+		local ok, result = pcall(mousemoverel, command.X, command.Y)
+		if not ok or result == false then
+			traceAimMouse(screenPoint, mousePos, command, response, alpha, "mousemoverel failed", dt)
+			resetAimMouseController()
+			return false
+		end
+	end
+	traceAimMouse(screenPoint, mousePos, command, response, alpha, sent and "sent" or "settled", dt)
+	state.lastMouse, state.lastScreenPoint = mousePos, screenPoint
+	state.lastAngles, state.lastCommand = angles, command
 	return true
 end
 
@@ -3328,7 +3439,7 @@ OS_HELP_TEXT = {
 	["Target Switch"] = "Allows aim assist to switch to a new target while held.",
 	["Aim Prediction"] = "Offsets aim based on target movement.",
 	["Studs"] = "Sets how far prediction leads moving targets.",
-	["Smoothness"] = "Higher values make aim movement slower and smoother.",
+	["Smoothness"] = "0 sends the full aim correction. Higher values smooth acquisition; free-cursor tracking follows target movement directly.",
 	["Save File"] = "Saves the current config to Fracture/config.json for automatic loading.",
 	["Load File"] = "Loads Fracture/config.json right now.",
 	["Export Code"] = "Creates a portable config code from the current settings.",
@@ -5228,7 +5339,7 @@ function OS_buildIndexPage()
 	add("Main", "Aim", "Aim assist can run in Camera mode or Mouse mode. Camera mode points the camera toward the selected body part. Mouse mode nudges the mouse toward the target when mouse movement support exists.")
 	add("Main", "Aim Targeting", "Target choice uses your selected hitbox part, distance to the camera center or mouse position, the aim radius, live humanoid checks, NPC AIM settings, and player filter rules.")
 	add("Main", "Aim Prediction", "Prediction offsets the aim point based on target movement across the screen plane. Increase Studs to lead moving targets farther.")
-	add("Main", "Smoothness", "Higher smoothness makes camera or mouse correction slower. Lower smoothness snaps more directly.")
+	add("Main", "Smoothness", "0 sends the full correction without a reversal brake. Higher values smooth acquisition; Mouse mode follows free-cursor target movement directly. The game still controls how injected input is consumed.")
 	add("Main", "Noclip", "Noclip locally changes your character parts to a no-collision collision group and restores saved collision settings when disabled.")
 	add("Main", "Invis", "Invis is local. It shifts the root briefly and uses transparency modifiers so your client sees a semi-transparent character while preserving a restore CFrame.")
 	add("Main", "Fling", "Touch Fling rapidly changes HumanoidRootPart velocity while enabled. It is gated by Fling Armed and can show a notification.")
@@ -5278,7 +5389,7 @@ function OS_buildIndexPage()
 	add("Runtime", "Rainbow Runtime", "Rainbow strokes, frames, text, images, scrollbars, and gradients are registered once, animated only while visible, and compacted when destroyed so re-executing or switching tabs does not leave dead animation work behind.")
 	add("Runtime", "Local Only Effects", "Brightness, wall transparency, highlights, many camera changes, and some movement helpers are local-client behavior.")
 	add("Troubleshooting", "File API Missing", "If your executor lacks writefile/readfile/isfile, Save File and Load File cannot work. Export and Import can still work through the code box.")
-	add("Troubleshooting", "Mouse Aim Missing", "Mouse mode needs mousemoverel. If that function does not exist, mouse nudging cannot run, but camera mode can still work.")
+	add("Troubleshooting", "Mouse Aim Missing", "Mouse mode needs mousemoverel. If unavailable or rejected, Mouse mode stays idle. Select Camera mode explicitly to aim with the camera.")
 	add("Troubleshooting", "After Respawn", "CharacterAdded refreshes noclip parts, resets infinite jump timing, stops freecam if needed, cleans fly movers, and restarts fly if it was active.")
 
 	local sortedHelp = {}
@@ -14763,9 +14874,10 @@ OS_RAINBOW_NEXT_UPDATE = 0
 OS_ESP_NEXT_UPDATE = 0
 OS_MAIN_UPDATE_BIND_NAME = ("OSMainUpdate_%s_%s"):format(LocalPlayer.UserId, tostring(OS_EXEC_ID))
 OS_MAIN_UPDATE_CONN = nil
+OS_AIM_UPDATE_BIND_NAME = ("OSAimUpdate_%s_%s"):format(LocalPlayer.UserId, tostring(OS_EXEC_ID))
 -- =========================
 -- MAIN RUNTIME UPDATE LOOP
--- Keeps UI effects, ESP, aim, and movement helpers synced every frame.
+-- Keeps UI effects, ESP, and movement helpers synced every frame.
 -- =========================
 function OS_runMainUpdate(dt)
 	if not OS_EXEC_IS_CURRENT() then return end
@@ -14946,6 +15058,11 @@ function OS_runMainUpdate(dt)
 		end
 	end
 
+end
+
+-- Sample after the standard camera/character render priorities, once per frame.
+function OS_runAimUpdate(dt)
+	if not OS_EXEC_IS_CURRENT() then return end
 	if aimEnabled then
 		if not aimArmed then
 			aimStop()
@@ -14967,45 +15084,38 @@ function OS_runMainUpdate(dt)
 			end
 		end
 
+		-- Both outputs consume this exact same target/prediction sample.
+		local aimPosition = getPredictedAimPosition(targetPart)
 		if aimControlMode == "Mouse" then
-			local aimScreenPoint, aimPosition = getAimLockScreenPoint(targetPart)
-			if not aimPosition then
-				destroyLaser()
-				return
-			end
-
+			local aimScreenPoint = worldToAimScreenPoint(aimPosition, false)
 			if aimScreenPoint then
-				if not nudgeMouseToward(aimScreenPoint, dt) then
-					applyCameraAim(aimPosition, dt)
-				end
+				nudgeMouseToward(aimScreenPoint, dt)
 			else
-				applyCameraAim(aimPosition, dt)
+				-- Retain the target, but no cursor command can reach behind/outside the viewport.
+				resetAimMouseController()
 			end
-
-			ensureLaser()
-			updateLaserStart()
-			setLaserEndPosition(aimPosition)
 		else
-			local aimPosition = getPredictedAimPosition(targetPart)
 			applyCameraAim(aimPosition, dt)
-
-			ensureLaser()
-			updateLaserStart()
-			setLaserEndPosition(aimPosition)
 		end
+
+		ensureLaser()
+		updateLaserStart()
+		setLaserEndPosition(aimPosition)
 	end
 end
 
 function OS_bindMainUpdate()
 	pcall(function()
-		RunService:UnbindToRenderStep(OS_MAIN_UPDATE_BIND_NAME)
+		RunService:UnbindFromRenderStep(OS_MAIN_UPDATE_BIND_NAME)
 	end)
 	if OS_MAIN_UPDATE_CONN then
 		OS_MAIN_UPDATE_CONN:Disconnect()
 		OS_MAIN_UPDATE_CONN = nil
 	end
 
+	RunService:UnbindFromRenderStep(OS_AIM_UPDATE_BIND_NAME)
 	OS_MAIN_UPDATE_CONN = RunService.RenderStepped:Connect(OS_runMainUpdate)
+	RunService:BindToRenderStep(OS_AIM_UPDATE_BIND_NAME, Enum.RenderPriority.Last.Value + 1, OS_runAimUpdate)
 end
 
 OS_bindMainUpdate()
@@ -15132,7 +15242,8 @@ OS_EXEC_GUARD.cleanup = function()
 		ContextActionService:UnbindAction(OS_GUI_POINTER_BLOCK_ACTION)
 	end)
 	pcall(function()
-		RunService:UnbindToRenderStep(OS_MAIN_UPDATE_BIND_NAME)
+		RunService:UnbindFromRenderStep(OS_MAIN_UPDATE_BIND_NAME)
+		RunService:UnbindFromRenderStep(OS_AIM_UPDATE_BIND_NAME)
 	end)
 	pcall(function()
 		if OS_MAIN_UPDATE_CONN then
